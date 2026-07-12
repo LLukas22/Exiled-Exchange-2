@@ -3,6 +3,10 @@ import {
   Ee2WaylandHelper,
   type Ee2WaylandHelperEvent,
 } from "./Ee2WaylandHelper";
+import {
+  WaylandPortalShortcuts,
+  type PortalShortcutEvent,
+} from "./WaylandPortalShortcuts";
 import { uIOhook, UiohookKey, UiohookWheelEvent } from "uiohook-napi";
 import {
   isModKey,
@@ -31,8 +35,12 @@ export class Shortcuts {
   private logKeys = false;
   private areaTracker: WidgetAreaTracker;
   private clipboard: HostClipboard;
+  private portalHelper?: WaylandPortalShortcuts;
   private linuxHelper?: Ee2WaylandHelper;
+  private copyHelper?: Ee2WaylandHelper;
+  private waylandHotkeyBackend: "portal" | "evdev" | null = null;
   private linuxHelperRunning = false;
+  private copyHelperRunning = false;
   private linuxHelperHotkeysKey: string | null = null;
   private linuxHelperActions = new Map<string, ShortcutAction>();
 
@@ -181,7 +189,7 @@ export class Shortcuts {
         !duplicates.has(action.shortcut) ||
         action.action.type === "toggle-overlay",
     );
-    this.syncLinuxHelper();
+    this.syncWaylandHotkeys();
     if (this.poeWindow.isActive) {
       this.unregister();
       this.register();
@@ -232,7 +240,7 @@ export class Shortcuts {
     globalShortcut.unregisterAll();
   }
 
-  private syncLinuxHelper() {
+  private syncWaylandHotkeys() {
     if (!isWayland()) return;
 
     // Register all configured hotkeys except test-only conflict-detection entries.
@@ -246,47 +254,94 @@ export class Shortcuts {
     }));
 
     const hotkeysKey = JSON.stringify(hotkeys);
-    if (hotkeysKey === this.linuxHelperHotkeysKey && this.linuxHelperRunning)
+    if (hotkeysKey === this.linuxHelperHotkeysKey && this.waylandHotkeyBackend)
       return;
-    this.linuxHelperHotkeysKey = hotkeysKey;
     this.linuxHelperActions = new Map(
       eligible.map((action, i) => [`action-${i}`, action]),
     );
 
+    if (!hotkeys.length) {
+      this.stopWaylandHotkeyBackend();
+      this.linuxHelperHotkeysKey = hotkeysKey;
+      return;
+    }
+
+    const doWork = async () => {
+      this.stopWaylandHotkeyBackend();
+
+      try {
+        await this.startPortalHotkeys(hotkeys);
+        this.waylandHotkeyBackend = "portal";
+        this.linuxHelperHotkeysKey = hotkeysKey;
+        this.logger.write(
+          `info [wayland-portal] using GlobalShortcuts portal for ${hotkeys.length} hotkeys`,
+        );
+        return;
+      } catch (error) {
+        this.logger.write(
+          `warn [wayland-portal] unavailable, falling back to evdev: ${(error as Error).message}`,
+        );
+      }
+
+      await this.startEvdevHotkeys(hotkeys);
+      this.waylandHotkeyBackend = "evdev";
+      this.linuxHelperHotkeysKey = hotkeysKey;
+      this.logger.write(
+        `info [ee2-wayland-helper] using evdev fallback for ${hotkeys.length} hotkeys`,
+      );
+    };
+
+    doWork().catch((error) => {
+      this.linuxHelperRunning = false;
+      this.linuxHelperHotkeysKey = null;
+      this.waylandHotkeyBackend = null;
+      this.logger.write(
+        `error [ee2-wayland-helper] ${(error as Error).message}`,
+      );
+    });
+  }
+
+  private async startPortalHotkeys(
+    hotkeys: { id: string; accelerator: string }[],
+  ) {
+    this.portalHelper = new WaylandPortalShortcuts();
+    this.portalHelper.on("event", (event) => {
+      if (event.type === "error") {
+        this.logger.write(`error [wayland-portal] ${event.message}`);
+        return;
+      }
+      this.handleWaylandHotkeyEvent(event);
+    });
+    await this.portalHelper.start(hotkeys);
+  }
+
+  private async startEvdevHotkeys(
+    hotkeys: { id: string; accelerator: string }[],
+  ) {
     if (!this.linuxHelper) {
       this.linuxHelper = new Ee2WaylandHelper();
       this.linuxHelper.on("event", (event) => {
-        this.handleLinuxHelperEvent(event);
+        this.handleWaylandHotkeyEvent(event);
       });
     }
-
-    const isStarting = !this.linuxHelperRunning;
-    this.logger.write(
-      `info [ee2-wayland-helper] ${isStarting ? "starting" : "updating"} ${hotkeys.length} hotkeys`,
-    );
-
-    const doWork = async () => {
-      if (this.linuxHelperRunning) {
-        this.linuxHelper!.setHotkeys(hotkeys);
-      } else {
-        await this.linuxHelper!.start(hotkeys);
-      }
-    };
-
-    doWork()
-      .then(() => {
-        this.linuxHelperRunning = true;
-      })
-      .catch((error) => {
-        this.linuxHelperRunning = false;
-        this.linuxHelperHotkeysKey = null;
-        this.logger.write(
-          `error [ee2-wayland-helper] ${(error as Error).message}`,
-        );
-      });
+    await this.linuxHelper.start(hotkeys);
+    this.linuxHelperRunning = true;
   }
 
-  private handleLinuxHelperEvent(event: Ee2WaylandHelperEvent) {
+  private stopWaylandHotkeyBackend() {
+    this.portalHelper?.stop();
+    this.portalHelper = undefined;
+    if (this.linuxHelperRunning) {
+      this.linuxHelper?.stop();
+      this.linuxHelper = undefined;
+      this.linuxHelperRunning = false;
+    }
+    this.waylandHotkeyBackend = null;
+  }
+
+  private handleWaylandHotkeyEvent(
+    event: Ee2WaylandHelperEvent | PortalShortcutEvent,
+  ) {
     if (event.type === "hotkey") {
       const entry = this.linuxHelperActions.get(event.id);
       if (!entry) return;
@@ -298,8 +353,12 @@ export class Shortcuts {
         return;
       this.runAction(entry);
     } else if (event.type === "exit") {
-      this.linuxHelperRunning = false;
+      if (!this.waylandHotkeyBackend) return;
+      if (this.waylandHotkeyBackend === "evdev") {
+        this.linuxHelperRunning = false;
+      }
       this.linuxHelperHotkeysKey = null;
+      this.waylandHotkeyBackend = null;
     } else if (event.type === "error") {
       this.logger.write(`error [ee2-wayland-helper] ${event.message}`);
     }
@@ -343,15 +402,13 @@ export class Shortcuts {
         })
         .catch(() => {});
       if (isWayland()) {
-        this.linuxHelper
-          ?.copyItemText(
-            mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
-          )
-          .catch((error) => {
-            this.logger.write(
-              `error [ee2-wayland-helper] copy failed: ${(error as Error).message}`,
-            );
-          });
+        this.copyItemTextWayland(
+          mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
+        ).catch((error) => {
+          this.logger.write(
+            `error [ee2-wayland-helper] copy failed: ${(error as Error).message}`,
+          );
+        });
       } else {
         pressKeysToCopyItemText(
           entry.keepModKeys
@@ -388,6 +445,32 @@ export class Shortcuts {
         })
         .catch(() => {});
     }
+  }
+
+  private async copyItemTextWayland(accelerator: string) {
+    const helper = await this.ensureWaylandCopyHelper();
+    await helper.copyItemText(accelerator);
+  }
+
+  private async ensureWaylandCopyHelper() {
+    if (this.linuxHelperRunning && this.linuxHelper) {
+      return this.linuxHelper;
+    }
+    if (!this.copyHelper) {
+      this.copyHelper = new Ee2WaylandHelper();
+      this.copyHelper.on("event", (event) => {
+        if (event.type === "error") {
+          this.logger.write(`error [ee2-wayland-helper] ${event.message}`);
+        } else if (event.type === "exit") {
+          this.copyHelperRunning = false;
+        }
+      });
+    }
+    if (!this.copyHelperRunning) {
+      await this.copyHelper.start([]);
+      this.copyHelperRunning = true;
+    }
+    return this.copyHelper;
   }
 }
 

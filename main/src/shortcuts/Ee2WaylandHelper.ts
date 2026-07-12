@@ -121,7 +121,7 @@ export class Ee2WaylandHelper extends EventEmitter {
       child.stdin.write(
         `${JSON.stringify({
           parentPid: process.pid,
-          devices: discoverEventDevices(),
+          devices: hotkeys.length ? discoverEventDevices() : [],
           hotkeys: parseHotkeys(hotkeys),
           enableUinput: true,
         })}\n`,
