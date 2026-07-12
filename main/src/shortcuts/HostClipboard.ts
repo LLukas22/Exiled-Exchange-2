@@ -28,7 +28,7 @@ export class HostClipboard {
     this.shouldRestore = restoreClipboard;
   }
 
-  async readItemText(): Promise<string> {
+  async readItemText(opts: { pollLimit?: number } = {}): Promise<string> {
     this.elapsed = 0;
     if (this.pollPromise) {
       return await this.pollPromise;
@@ -61,7 +61,7 @@ export class HostClipboard {
           resolve(textAfter);
         } else {
           this.elapsed += POLL_DELAY;
-          if (this.elapsed < POLL_LIMIT) {
+          if (this.elapsed < (opts.pollLimit ?? POLL_LIMIT)) {
             setTimeout(poll, POLL_DELAY);
           } else {
             if (this.shouldRestore) {

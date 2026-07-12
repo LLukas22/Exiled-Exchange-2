@@ -11,11 +11,14 @@ use.
 
 Current state:
 
-- The Rust helper is a protocol scaffold only.
+- The Rust helper is the Wayland hotkey backend.
 - It supports `--version` and `--health-check`.
 - It emits NDJSON events on stdout.
-- Evdev capture and uinput copy injection are intentionally not implemented yet.
+- It reads configured evdev devices and emits only registered hotkey events.
+- It creates a narrow uinput keyboard and accepts a `copy` command for the Path
+  of Exile item-copy key combo.
 
-Next implementation target: add a narrow uinput command that sends the Path of
-Exile item-copy key combo on Wayland, then route `copy-item` actions through this
-helper instead of `uIOhook`.
+The `copy-item` action starts clipboard polling, then asks the helper to send the
+copy combo through uinput. This replaces the old Wayland path where hotkey input
+used evdev but copy output still used X11/XTEST via `uIOhook`, causing
+`No item text found` timeouts.

@@ -1,11 +1,8 @@
-import { app, screen, globalShortcut } from "electron";
-import path from "node:path";
-import fs from "node:fs/promises";
-import os from "node:os";
+import { screen, globalShortcut } from "electron";
 import {
-  LinuxEvdevHelper,
-  type LinuxEvdevHelperEvent,
-} from "linux-evdev-wayland-helper";
+  Ee2WaylandHelper,
+  type Ee2WaylandHelperEvent,
+} from "./Ee2WaylandHelper";
 import { uIOhook, UiohookKey, UiohookWheelEvent } from "uiohook-napi";
 import {
   isModKey,
@@ -34,7 +31,7 @@ export class Shortcuts {
   private logKeys = false;
   private areaTracker: WidgetAreaTracker;
   private clipboard: HostClipboard;
-  private linuxHelper?: LinuxEvdevHelper;
+  private linuxHelper?: Ee2WaylandHelper;
   private linuxHelperRunning = false;
   private linuxHelperHotkeysKey: string | null = null;
   private linuxHelperActions = new Map<string, ShortcutAction>();
@@ -257,7 +254,7 @@ export class Shortcuts {
     );
 
     if (!this.linuxHelper) {
-      this.linuxHelper = new LinuxEvdevHelper();
+      this.linuxHelper = new Ee2WaylandHelper();
       this.linuxHelper.on("event", (event) => {
         this.handleLinuxHelperEvent(event);
       });
@@ -265,22 +262,14 @@ export class Shortcuts {
 
     const isStarting = !this.linuxHelperRunning;
     this.logger.write(
-      `info [linux-evdev-helper] ${isStarting ? "starting" : "updating"} ${hotkeys.length} hotkeys`,
+      `info [ee2-wayland-helper] ${isStarting ? "starting" : "updating"} ${hotkeys.length} hotkeys`,
     );
 
     const doWork = async () => {
-      const helperPath = await stageHelperBinary(getLinuxEvdevHelperPath());
       if (this.linuxHelperRunning) {
-        await this.linuxHelper!.setHotkeys(hotkeys);
+        this.linuxHelper!.setHotkeys(hotkeys);
       } else {
-        await this.linuxHelper!.start({
-          helperPath,
-          hotkeys,
-          allDevices: true,
-          elevation: "pkexec",
-          enableUinput: false,
-          parentPid: process.pid,
-        });
+        await this.linuxHelper!.start(hotkeys);
       }
     };
 
@@ -292,12 +281,12 @@ export class Shortcuts {
         this.linuxHelperRunning = false;
         this.linuxHelperHotkeysKey = null;
         this.logger.write(
-          `error [linux-evdev-helper] ${(error as Error).message}`,
+          `error [ee2-wayland-helper] ${(error as Error).message}`,
         );
       });
   }
 
-  private handleLinuxHelperEvent(event: LinuxEvdevHelperEvent) {
+  private handleLinuxHelperEvent(event: Ee2WaylandHelperEvent) {
     if (event.type === "hotkey") {
       const entry = this.linuxHelperActions.get(event.id);
       if (!entry) return;
@@ -305,13 +294,14 @@ export class Shortcuts {
       // or any compositor that ignores the activation request), poeWindow.isActive
       // stays false and blur never fires. Allow toggle-overlay through so the
       // hotkey can close the overlay it opened. All other actions require PoE focus.
-      if (!this.poeWindow.isActive && entry.action.type !== "toggle-overlay") return;
+      if (!this.poeWindow.isActive && entry.action.type !== "toggle-overlay")
+        return;
       this.runAction(entry);
     } else if (event.type === "exit") {
       this.linuxHelperRunning = false;
       this.linuxHelperHotkeysKey = null;
     } else if (event.type === "error") {
-      this.logger.write(`error [linux-evdev-helper] ${event.message}`);
+      this.logger.write(`error [ee2-wayland-helper] ${event.message}`);
     }
   }
 
@@ -334,8 +324,8 @@ export class Shortcuts {
     } else if (entry.action.type === "copy-item") {
       const { action } = entry;
       const pressPosition = screen.getCursorScreenPoint();
-      this.clipboard
-        .readItemText()
+      const itemText = this.clipboard
+        .readItemText({ pollLimit: isWayland() ? 1600 : undefined })
         .then((clipboard) => {
           this.areaTracker.removeListeners();
           this.server.sendEventTo("last-active", {
@@ -352,12 +342,25 @@ export class Shortcuts {
           }
         })
         .catch(() => {});
-      pressKeysToCopyItemText(
-        entry.keepModKeys
-          ? entry.shortcut.split(" + ").filter((key) => isModKey(key))
-          : undefined,
-        this.gameConfig.showModsKey,
-      );
+      if (isWayland()) {
+        this.linuxHelper
+          ?.copyItemText(
+            mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
+          )
+          .catch((error) => {
+            this.logger.write(
+              `error [ee2-wayland-helper] copy failed: ${(error as Error).message}`,
+            );
+          });
+      } else {
+        pressKeysToCopyItemText(
+          entry.keepModKeys
+            ? entry.shortcut.split(" + ").filter((key) => isModKey(key))
+            : undefined,
+          this.gameConfig.showModsKey,
+        );
+      }
+      void itemText;
     } else if (
       entry.action.type === "ocr-text" &&
       entry.action.target === "heist-gems"
@@ -394,34 +397,6 @@ function isWayland(): boolean {
     (process.env.XDG_SESSION_TYPE === "wayland" ||
       Boolean(process.env.WAYLAND_DISPLAY))
   );
-}
-
-function getLinuxEvdevHelperPath(): string | undefined {
-  if (!app.isPackaged) return undefined;
-
-  return path.join(
-    process.resourcesPath,
-    "app.asar.unpacked",
-    "node_modules",
-    "linux-evdev-wayland-helper",
-    "native",
-    "linux-evdev-helper",
-    "linux-evdev-helper",
-  );
-}
-
-// When running from an AppImage the helper binary lives inside a FUSE mount
-// that is private to the mounting user. pkexec runs as root and cannot read
-// files from that mount (FUSE does not honour root's DAC bypass without
-// allow_other). Copy the binary to a world-accessible tmp path before exec-ing.
-async function stageHelperBinary(
-  sourcePath: string | undefined,
-): Promise<string | undefined> {
-  if (!sourcePath) return undefined;
-  const dest = path.join(os.tmpdir(), "linux-evdev-helper");
-  await fs.copyFile(sourcePath, dest);
-  await fs.chmod(dest, 0o755);
-  return dest;
 }
 
 function pressKeysToCopyItemText(
