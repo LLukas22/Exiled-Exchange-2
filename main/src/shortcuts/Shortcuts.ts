@@ -25,6 +25,11 @@ import type { GameConfig } from "../host-files/GameConfig";
 import type { ServerEvents } from "../server";
 
 type UiohookKeyT = keyof typeof UiohookKey;
+type CopyItemAction = Extract<ShortcutAction["action"], { type: "copy-item" }>;
+
+const WAYLAND_COPY_POLL_LIMIT = 2200;
+const WAYLAND_COPY_RETRY_DELAYS = [0, 160, 320, 640];
+
 const UiohookToName = Object.fromEntries(
   Object.entries(UiohookKey).map(([k, v]) => [v, k]),
 );
@@ -383,33 +388,19 @@ export class Shortcuts {
     } else if (entry.action.type === "copy-item") {
       const { action } = entry;
       const pressPosition = screen.getCursorScreenPoint();
-      const itemText = this.clipboard
-        .readItemText({ pollLimit: isWayland() ? 1600 : undefined })
-        .then((clipboard) => {
-          this.areaTracker.removeListeners();
-          this.server.sendEventTo("last-active", {
-            name: "MAIN->CLIENT::item-text",
-            payload: {
-              target: action.target,
-              clipboard,
-              position: pressPosition,
-              focusOverlay: Boolean(action.focusOverlay),
-            },
-          });
-          if (action.focusOverlay && this.overlay.wasUsedRecently) {
-            this.overlay.assertOverlayActive();
-          }
-        })
-        .catch(() => {});
       if (isWayland()) {
-        this.copyItemTextWayland(
-          mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
-        ).catch((error) => {
+        this.handleWaylandCopyItem(action, pressPosition).catch((error) => {
           this.logger.write(
             `error [ee2-wayland-helper] copy failed: ${(error as Error).message}`,
           );
         });
       } else {
+        this.clipboard
+          .readItemText()
+          .then((clipboard) => {
+            this.emitItemText(action, clipboard, pressPosition);
+          })
+          .catch(() => {});
         pressKeysToCopyItemText(
           entry.keepModKeys
             ? entry.shortcut.split(" + ").filter((key) => isModKey(key))
@@ -417,7 +408,6 @@ export class Shortcuts {
           this.gameConfig.showModsKey,
         );
       }
-      void itemText;
     } else if (
       entry.action.type === "ocr-text" &&
       entry.action.target === "heist-gems"
@@ -447,9 +437,70 @@ export class Shortcuts {
     }
   }
 
-  private async copyItemTextWayland(accelerator: string) {
+  private async handleWaylandCopyItem(
+    action: CopyItemAction,
+    pressPosition: { x: number; y: number },
+  ) {
     const helper = await this.ensureWaylandCopyHelper();
-    await helper.copyItemText(accelerator);
+    let itemFound = false;
+    const clipboardText = this.clipboard
+      .readItemText({ pollLimit: WAYLAND_COPY_POLL_LIMIT })
+      .then((clipboard) => {
+        itemFound = true;
+        this.emitItemText(action, clipboard, pressPosition);
+      })
+      .catch(() => {
+        itemFound = true;
+      });
+
+    await this.copyItemTextWayland(
+      helper,
+      mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
+      () => itemFound,
+    );
+    await clipboardText;
+  }
+
+  private async copyItemTextWayland(
+    helper: Ee2WaylandHelper,
+    accelerator: string,
+    isDone: () => boolean,
+  ) {
+    let lastError: unknown;
+    for (const delay of WAYLAND_COPY_RETRY_DELAYS) {
+      if (delay) await wait(delay);
+      if (isDone()) return;
+      try {
+        await helper.copyItemText(accelerator);
+        lastError = undefined;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (lastError && !isDone()) {
+      throw lastError;
+    }
+  }
+
+  private emitItemText(
+    action: CopyItemAction,
+    clipboard: string,
+    pressPosition: { x: number; y: number },
+  ) {
+    this.areaTracker.removeListeners();
+    this.server.sendEventTo("last-active", {
+      name: "MAIN->CLIENT::item-text",
+      payload: {
+        target: action.target,
+        clipboard,
+        position: pressPosition,
+        focusOverlay: Boolean(action.focusOverlay),
+      },
+    });
+    if (action.focusOverlay && this.overlay.wasUsedRecently) {
+      this.overlay.assertOverlayActive();
+    }
   }
 
   private async ensureWaylandCopyHelper() {
@@ -480,6 +531,10 @@ function isWayland(): boolean {
     (process.env.XDG_SESSION_TYPE === "wayland" ||
       Boolean(process.env.WAYLAND_DISPLAY))
   );
+}
+
+async function wait(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function pressKeysToCopyItemText(
