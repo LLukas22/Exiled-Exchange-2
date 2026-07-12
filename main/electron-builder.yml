@@ -8,10 +8,14 @@ files:
   - from: "dist"
     to: "."
     filter: ["main.js", "vision.js"]
+  - from: "dist/native"
+    to: "native"
+    filter: ["ee2-wayland-helper"]
   - from: "../renderer/dist"
     to: "."
 asarUnpack:
   - "node_modules/linux-evdev-wayland-helper/native/linux-evdev-helper/linux-evdev-helper"
+  - "native/ee2-wayland-helper"
 extraMetadata:
   main: "main.js"
 nsis:

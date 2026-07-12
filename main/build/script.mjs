@@ -3,6 +3,7 @@ import electron from 'electron'
 import esbuild from 'esbuild'
 import fs from 'fs'
 import path from 'path'
+import { buildRustHelper } from './rust-helper.mjs'
 
 const isDev = !process.argv.includes('--prod')
 const debugPort = process.env.EE2_REMOTE_DEBUGGING_PORT || '9222'
@@ -13,6 +14,8 @@ const chromiumLogPath = path.join(debugDir, 'chromium.log')
 if (isDev) {
   fs.mkdirSync(debugDir, { recursive: true })
 }
+
+buildRustHelper({ release: !isDev })
 
 const electronRunner = (() => {
   let handle = null
