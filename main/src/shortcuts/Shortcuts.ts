@@ -1,12 +1,9 @@
 import { screen, globalShortcut } from "electron";
 import {
-  Ee2WaylandHelper,
-  type Ee2WaylandHelperEvent,
-} from "./Ee2WaylandHelper";
-import {
   WaylandPortalShortcuts,
   type PortalShortcutEvent,
 } from "./WaylandPortalShortcuts";
+import { Hyprland } from "./Hyprland";
 import { uIOhook, UiohookKey, UiohookWheelEvent } from "uiohook-napi";
 import {
   isModKey,
@@ -27,9 +24,6 @@ import type { ServerEvents } from "../server";
 type UiohookKeyT = keyof typeof UiohookKey;
 type CopyItemAction = Extract<ShortcutAction["action"], { type: "copy-item" }>;
 
-const WAYLAND_COPY_POLL_LIMIT = 2200;
-const WAYLAND_COPY_RETRY_DELAYS = [0, 160, 320, 640];
-
 const UiohookToName = Object.fromEntries(
   Object.entries(UiohookKey).map(([k, v]) => [v, k]),
 );
@@ -41,13 +35,10 @@ export class Shortcuts {
   private areaTracker: WidgetAreaTracker;
   private clipboard: HostClipboard;
   private portalHelper?: WaylandPortalShortcuts;
-  private linuxHelper?: Ee2WaylandHelper;
-  private copyHelper?: Ee2WaylandHelper;
-  private waylandHotkeyBackend: "portal" | "evdev" | null = null;
-  private linuxHelperRunning = false;
-  private copyHelperRunning = false;
-  private linuxHelperHotkeysKey: string | null = null;
-  private linuxHelperActions = new Map<string, ShortcutAction>();
+  private portalHotkeysKey: string | null = null;
+  private portalSync = Promise.resolve();
+  private hyprland = new Hyprland();
+  private waylandCopyPending = false;
 
   static async create(
     logger: Logger,
@@ -128,17 +119,34 @@ export class Shortcuts {
     this.clipboard.updateDelay(delay);
   }
 
+  async dispose() {
+    this.portalHotkeysKey = null;
+    await this.portalSync.catch(() => {});
+    this.portalHelper?.stop();
+    this.portalHelper = undefined;
+    this.hyprland.stopInputHelper();
+    try {
+      await this.hyprland.clearGlobalBinds();
+    } catch (error) {
+      this.logger.write(
+        `error [hyprland] failed to remove temporary binds: ${(error as Error).message}`,
+      );
+    }
+  }
+
   updateActions(
     actions: ShortcutAction[],
     stashScroll: boolean,
     logKeys: boolean,
     restoreClipboard: boolean,
     language: string,
+    windowTitle: string,
   ) {
     this.stashScroll = stashScroll;
     this.logKeys = logKeys;
     this.clipboard.updateOptions(restoreClipboard);
     this.ocrWorker.updateOptions(language);
+    this.hyprland.updateWindowTitle(windowTitle);
 
     const copyItemShortcut = mergeTwoHotkeys(
       "Ctrl + C",
@@ -202,10 +210,8 @@ export class Shortcuts {
   }
 
   private register() {
-    // On Wayland, globalShortcut uses XGrabKey via XWayland. This double-fires
-    // every action already handled by the evdev helper, and the XGrabKey grabs
-    // interfere with PoE2's own input handling. The evdev helper is the sole
-    // hotkey mechanism on Wayland.
+    // On Wayland, globalShortcut uses XGrabKey via XWayland and interferes with
+    // PoE2's own input handling. The GlobalShortcuts portal is used instead.
     if (isWayland()) return;
     for (const entry of this.actions) {
       const isOk = globalShortcut.register(
@@ -245,127 +251,130 @@ export class Shortcuts {
     globalShortcut.unregisterAll();
   }
 
-  private syncWaylandHotkeys() {
+  private syncWaylandHotkeys(actions = this.actions) {
     if (!isWayland()) return;
 
-    // Register all configured hotkeys except test-only conflict-detection entries.
-    // The helper runs while PoE has focus; once the overlay is shown poeWindow.isActive
-    // becomes false and handleLinuxHelperEvent ignores events, leaving Electron's own
-    // keyboard handling (handleExtraCommands in OverlayWindow) in charge.
-    const eligible = this.actions.filter((a) => a.action.type !== "test-only");
-    const hotkeys = eligible.map((action, i) => ({
-      id: `action-${i}`,
-      accelerator: action.shortcut,
-    }));
-
+    const eligible = actions.filter((a) => a.action.type !== "test-only");
+    const idCounts = new Map<string, number>();
+    const registered = eligible.map((action) => {
+      const baseId = portalActionId(action);
+      const count = idCounts.get(baseId) ?? 0;
+      idCounts.set(baseId, count + 1);
+      return {
+        action,
+        hotkey: {
+          id: count ? `${baseId}-${count + 1}` : baseId,
+          accelerator: action.shortcut,
+        },
+      };
+    });
+    const hotkeys = registered.map(({ hotkey }) => hotkey);
     const hotkeysKey = JSON.stringify(hotkeys);
-    if (hotkeysKey === this.linuxHelperHotkeysKey && this.waylandHotkeyBackend)
-      return;
-    this.linuxHelperActions = new Map(
-      eligible.map((action, i) => [`action-${i}`, action]),
+    if (hotkeysKey === this.portalHotkeysKey) return;
+
+    this.portalHotkeysKey = hotkeysKey;
+    const portalActions = new Map(
+      registered.map(({ action, hotkey }) => [hotkey.id, action]),
     );
+    this.portalSync = this.portalSync
+      .catch(() => {})
+      .then(async () => {
+        if (hotkeysKey !== this.portalHotkeysKey) return;
 
-    if (!hotkeys.length) {
-      this.stopWaylandHotkeyBackend();
-      this.linuxHelperHotkeysKey = hotkeysKey;
+        try {
+          await this.hyprland.clearGlobalBinds();
+        } catch (error) {
+          if (hotkeysKey === this.portalHotkeysKey) {
+            this.portalHotkeysKey = null;
+          }
+          this.logger.write(
+            `error [hyprland] failed to remove temporary binds: ${(error as Error).message}`,
+          );
+          return;
+        }
+        this.portalHelper?.stop();
+        this.portalHelper = undefined;
+        if (!hotkeys.length) return;
+
+        const portal = new WaylandPortalShortcuts();
+        portal.on("event", (event) => {
+          if (event.type === "error") {
+            this.logger.write(`error [wayland-portal] ${event.message}`);
+          } else if (event.type === "debug") {
+            this.logger.write(`debug [wayland-portal] ${event.message}`);
+          } else {
+            this.handleWaylandHotkeyEvent(event, portalActions).catch(
+              (error) => {
+                this.logger.write(
+                  `error [wayland-portal] ${(error as Error).message}`,
+                );
+              },
+            );
+          }
+        });
+
+        try {
+          await portal.start(hotkeys);
+        } catch (error) {
+          await this.hyprland.clearGlobalBinds().catch(() => {});
+          if (hotkeysKey === this.portalHotkeysKey) {
+            this.portalHotkeysKey = null;
+          }
+          this.logger.write(
+            `error [wayland-portal] GlobalShortcuts unavailable: ${(error as Error).message}`,
+          );
+          return;
+        }
+        if (hotkeysKey !== this.portalHotkeysKey) {
+          portal.stop();
+          return;
+        }
+
+        try {
+          await this.hyprland.replaceGlobalBinds(hotkeys);
+        } catch (error) {
+          portal.stop();
+          if (hotkeysKey === this.portalHotkeysKey) {
+            this.portalHotkeysKey = null;
+          }
+          this.logger.write(
+            `error [hyprland] failed to install temporary binds: ${(error as Error).message}`,
+          );
+          return;
+        }
+        if (hotkeysKey !== this.portalHotkeysKey) {
+          await this.hyprland.clearGlobalBinds().catch(() => {});
+          portal.stop();
+          return;
+        }
+
+        this.portalHelper = portal;
+        this.logger.write(
+          `info [hyprland] installed ${hotkeys.length} temporary non-consuming binds`,
+        );
+      });
+  }
+
+  private async handleWaylandHotkeyEvent(
+    event: PortalShortcutEvent,
+    actions: Map<string, ShortcutAction>,
+  ) {
+    if (event.type !== "hotkey" || event.state !== "released") return;
+
+    const entry = actions.get(event.id);
+    if (!entry) return;
+    if (this.logKeys) {
+      this.logger.write(
+        `debug [wayland-portal] Hotkey released ${event.accelerator}`,
+      );
+    }
+
+    if (this.overlay.isInteractable) {
+      if (entry.action.type === "toggle-overlay") this.runAction(entry);
       return;
     }
-
-    const doWork = async () => {
-      this.stopWaylandHotkeyBackend();
-
-      try {
-        await this.startPortalHotkeys(hotkeys);
-        this.waylandHotkeyBackend = "portal";
-        this.linuxHelperHotkeysKey = hotkeysKey;
-        this.logger.write(
-          `info [wayland-portal] using GlobalShortcuts portal for ${hotkeys.length} hotkeys`,
-        );
-        return;
-      } catch (error) {
-        this.logger.write(
-          `warn [wayland-portal] unavailable, falling back to evdev: ${(error as Error).message}`,
-        );
-      }
-
-      await this.startEvdevHotkeys(hotkeys);
-      this.waylandHotkeyBackend = "evdev";
-      this.linuxHelperHotkeysKey = hotkeysKey;
-      this.logger.write(
-        `info [ee2-wayland-helper] using evdev fallback for ${hotkeys.length} hotkeys`,
-      );
-    };
-
-    doWork().catch((error) => {
-      this.linuxHelperRunning = false;
-      this.linuxHelperHotkeysKey = null;
-      this.waylandHotkeyBackend = null;
-      this.logger.write(
-        `error [ee2-wayland-helper] ${(error as Error).message}`,
-      );
-    });
-  }
-
-  private async startPortalHotkeys(
-    hotkeys: { id: string; accelerator: string }[],
-  ) {
-    this.portalHelper = new WaylandPortalShortcuts();
-    this.portalHelper.on("event", (event) => {
-      if (event.type === "error") {
-        this.logger.write(`error [wayland-portal] ${event.message}`);
-        return;
-      }
-      this.handleWaylandHotkeyEvent(event);
-    });
-    await this.portalHelper.start(hotkeys);
-  }
-
-  private async startEvdevHotkeys(
-    hotkeys: { id: string; accelerator: string }[],
-  ) {
-    if (!this.linuxHelper) {
-      this.linuxHelper = new Ee2WaylandHelper();
-      this.linuxHelper.on("event", (event) => {
-        this.handleWaylandHotkeyEvent(event);
-      });
-    }
-    await this.linuxHelper.start(hotkeys);
-    this.linuxHelperRunning = true;
-  }
-
-  private stopWaylandHotkeyBackend() {
-    this.portalHelper?.stop();
-    this.portalHelper = undefined;
-    if (this.linuxHelperRunning) {
-      this.linuxHelper?.stop();
-      this.linuxHelper = undefined;
-      this.linuxHelperRunning = false;
-    }
-    this.waylandHotkeyBackend = null;
-  }
-
-  private handleWaylandHotkeyEvent(
-    event: Ee2WaylandHelperEvent | PortalShortcutEvent,
-  ) {
-    if (event.type === "hotkey") {
-      const entry = this.linuxHelperActions.get(event.id);
-      if (!entry) return;
-      // When the overlay is shown without keyboard focus (e.g. --ozone-platform=x11
-      // or any compositor that ignores the activation request), poeWindow.isActive
-      // stays false and blur never fires. Allow toggle-overlay through so the
-      // hotkey can close the overlay it opened. All other actions require PoE focus.
-      if (!this.poeWindow.isActive && entry.action.type !== "toggle-overlay")
-        return;
+    if (await this.hyprland.isGameActive()) {
       this.runAction(entry);
-    } else if (event.type === "exit") {
-      if (!this.waylandHotkeyBackend) return;
-      if (this.waylandHotkeyBackend === "evdev") {
-        this.linuxHelperRunning = false;
-      }
-      this.linuxHelperHotkeysKey = null;
-      this.waylandHotkeyBackend = null;
-    } else if (event.type === "error") {
-      this.logger.write(`error [ee2-wayland-helper] ${event.message}`);
     }
   }
 
@@ -391,7 +400,7 @@ export class Shortcuts {
       if (isWayland()) {
         this.handleWaylandCopyItem(action, pressPosition).catch((error) => {
           this.logger.write(
-            `error [ee2-wayland-helper] copy failed: ${(error as Error).message}`,
+            `error [hyprland] copy failed: ${(error as Error).message}`,
           );
         });
       } else {
@@ -441,45 +450,16 @@ export class Shortcuts {
     action: CopyItemAction,
     pressPosition: { x: number; y: number },
   ) {
-    const helper = await this.ensureWaylandCopyHelper();
-    let itemFound = false;
-    const clipboardText = this.clipboard
-      .readItemText({ pollLimit: WAYLAND_COPY_POLL_LIMIT })
-      .then((clipboard) => {
-        itemFound = true;
-        this.emitItemText(action, clipboard, pressPosition);
-      })
-      .catch(() => {
-        itemFound = true;
-      });
-
-    await this.copyItemTextWayland(
-      helper,
-      mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
-      () => itemFound,
-    );
-    await clipboardText;
-  }
-
-  private async copyItemTextWayland(
-    helper: Ee2WaylandHelper,
-    accelerator: string,
-    isDone: () => boolean,
-  ) {
-    let lastError: unknown;
-    for (const delay of WAYLAND_COPY_RETRY_DELAYS) {
-      if (delay) await wait(delay);
-      if (isDone()) return;
-      try {
-        await helper.copyItemText(accelerator);
-        lastError = undefined;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    if (lastError && !isDone()) {
-      throw lastError;
+    if (this.waylandCopyPending) return;
+    this.waylandCopyPending = true;
+    try {
+      const clipboard = await this.hyprland.copyItemText(
+        mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
+        this.clipboard.restoreEnabled,
+      );
+      this.emitItemText(action, clipboard, pressPosition);
+    } finally {
+      this.waylandCopyPending = false;
     }
   }
 
@@ -502,27 +482,39 @@ export class Shortcuts {
       this.overlay.assertOverlayActive();
     }
   }
+}
 
-  private async ensureWaylandCopyHelper() {
-    if (this.linuxHelperRunning && this.linuxHelper) {
-      return this.linuxHelper;
-    }
-    if (!this.copyHelper) {
-      this.copyHelper = new Ee2WaylandHelper();
-      this.copyHelper.on("event", (event) => {
-        if (event.type === "error") {
-          this.logger.write(`error [ee2-wayland-helper] ${event.message}`);
-        } else if (event.type === "exit") {
-          this.copyHelperRunning = false;
-        }
-      });
-    }
-    if (!this.copyHelperRunning) {
-      await this.copyHelper.start([]);
-      this.copyHelperRunning = true;
-    }
-    return this.copyHelper;
+function portalActionId(entry: ShortcutAction) {
+  const action = entry.action;
+  if (action.type === "toggle-overlay") return "toggle-overlay";
+  if (action.type === "copy-item") {
+    return `copy-${slug(action.target)}${action.focusOverlay ? "-locked" : ""}`;
   }
+  if (action.type === "trigger-event") return `event-${slug(action.target)}`;
+  if (action.type === "ocr-text") return `ocr-${slug(action.target)}`;
+  if (action.type === "stash-search") {
+    return `stash-search-${shortHash(action.text)}`;
+  }
+  if (action.type === "paste-in-chat") {
+    return `chat-command-${shortHash(`${action.text}:${action.send}`)}`;
+  }
+  return "test-only";
+}
+
+function slug(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function shortHash(value: string) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 function isWayland(): boolean {
@@ -531,10 +523,6 @@ function isWayland(): boolean {
     (process.env.XDG_SESSION_TYPE === "wayland" ||
       Boolean(process.env.WAYLAND_DISPLAY))
   );
-}
-
-async function wait(ms: number) {
-  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function pressKeysToCopyItemText(

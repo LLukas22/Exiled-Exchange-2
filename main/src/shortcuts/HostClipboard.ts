@@ -1,4 +1,5 @@
 import { clipboard, Clipboard } from "electron";
+import { execFile, spawn } from "node:child_process";
 import type { Logger } from "../RemoteLogger";
 
 const POLL_DELAY = 48;
@@ -20,6 +21,10 @@ export class HostClipboard {
 
   get isPolling() {
     return this.pollPromise != null;
+  }
+
+  get restoreEnabled() {
+    return this.shouldRestore;
   }
 
   constructor(private logger: Logger) {}
@@ -80,6 +85,62 @@ export class HostClipboard {
     });
 
     return await this.pollPromise;
+  }
+
+  async readItemTextWayland(
+    triggerCopy: () => Promise<void>,
+    opts: { pollLimit?: number } = {},
+  ): Promise<string> {
+    this.elapsed = 0;
+    if (!this.pollPromise) {
+      this.pollPromise = this.pollItemTextWayland(triggerCopy, opts).finally(
+        () => {
+          this.pollPromise = undefined;
+        },
+      );
+    }
+    return await this.pollPromise;
+  }
+
+  private async pollItemTextWayland(
+    triggerCopy: () => Promise<void>,
+    opts: { pollLimit?: number },
+  ) {
+    let textBefore = await readWaylandClipboard();
+    if (isPoeItem(textBefore)) textBefore = "";
+
+    await clearWaylandClipboard();
+    await triggerCopy();
+
+    const pollStartedAt = Date.now();
+    return await new Promise<string>((resolve, reject) => {
+      const poll = async () => {
+        const textAfter = await readWaylandClipboard().catch(() => "");
+        if (isPoeItem(textAfter)) {
+          if (this.shouldRestore) {
+            await writeWaylandClipboard(textBefore).catch(() => {});
+          }
+          resolve(textAfter);
+          return;
+        }
+
+        if (Date.now() - pollStartedAt < (opts.pollLimit ?? POLL_LIMIT)) {
+          setTimeout(() => {
+            poll().catch(reject);
+          }, POLL_DELAY);
+          return;
+        }
+
+        if (this.shouldRestore) {
+          await writeWaylandClipboard(textBefore).catch(() => {});
+        }
+        this.logger.write("warn [ClipboardPoller] No item text found.");
+        reject(new Error("Reading clipboard timed out"));
+      };
+      setTimeout(() => {
+        poll().catch(reject);
+      }, this.initialDelay);
+    });
   }
 
   // when `shouldRestore` is false, this function continues
@@ -171,3 +232,57 @@ const LANGUAGE_DETECTOR = [
     uncutSkillGemLine: "レアリティ: ",
   },
 ];
+
+async function readWaylandClipboard(): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    execFile(
+      "wl-paste",
+      ["--no-newline"],
+      { encoding: "utf8", timeout: 1000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          const code = (error as unknown as { code?: string | number }).code;
+          if (code === 1 || code === "1") {
+            resolve("");
+          } else {
+            reject(new Error(stderr.trim() || error.message));
+          }
+          return;
+        }
+        resolve(stdout);
+      },
+    );
+  });
+}
+
+async function writeWaylandClipboard(text: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("wl-copy", ["--type", "text/plain;charset=utf-8"], {
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    let settled = false;
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (!settled && code !== 0) {
+        reject(new Error(`wl-copy exited with code ${code}`));
+      }
+    });
+    child.stdin.on("error", reject);
+    child.stdin.end(text);
+    child.unref();
+    setTimeout(() => {
+      settled = true;
+      resolve();
+    }, 50);
+  });
+}
+
+async function clearWaylandClipboard(): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    execFile("wl-copy", ["--clear"], { timeout: 1000 }, (error, _, stderr) => {
+      if (error) reject(new Error(stderr.trim() || error.message));
+      else resolve();
+    });
+  });
+}

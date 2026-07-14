@@ -55,7 +55,7 @@ export class OverlayWindow {
       // that electron-overlay-window uses for game window attachment. Those
       // hints are meaningless on Wayland and can prevent the window from
       // rendering correctly. We use plain transparent window options instead
-      // and manage show/hide manually via the evdev hotkey backend.
+      // and manage show/hide manually via compositor-backed hotkeys.
       ...(isWayland()
         ? {
             frame: false,

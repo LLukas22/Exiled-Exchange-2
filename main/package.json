@@ -5,7 +5,6 @@
   "scripts": {
     "dev": "node build/script.mjs",
     "build": "tsc --noEmit && node build/script.mjs --prod",
-    "build:wayland-helper": "node build/rust-helper.mjs --release",
     "package": "electron-builder build",
     "lint": "eslint src",
     "fix": "eslint src --fix",
@@ -31,7 +30,7 @@
     "@types/ws": "^8.5.3",
     "@wokwi/bmp-ts": "^3.0.0",
     "comlink": "^4.3.1",
-    "electron": "^40.9.1",
+    "electron": "^40.10.6",
     "electron-builder": "^26.8.1",
     "electron-devtools-installer": "^4.0.0",
     "electron-updater": "^6.8.3",
@@ -53,5 +52,9 @@
   },
   "overrides": {
     "yauzl": "^3.3.1"
+  },
+  "allowScripts": {
+    "electron@40.10.6": true,
+    "esbuild@0.28.0": true
   }
 }

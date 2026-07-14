@@ -21,11 +21,34 @@ if (!app.requestSingleInstanceLock()) {
   app.exit();
 }
 
+if (process.platform === "linux") {
+  process.env.CHROME_DESKTOP = "exiled-exchange-2.desktop";
+  app.setName("exiled-exchange-2");
+  app.setDesktopName("exiled-exchange-2.desktop");
+  app.setAppUserModelId("exiled-exchange-2");
+  app.commandLine.appendSwitch("class", "exiled-exchange-2");
+}
+
 if (process.platform !== "darwin") {
   app.disableHardwareAcceleration();
 }
 app.enableSandbox();
 let tray: AppTray;
+let shortcuts: Shortcuts | undefined;
+let quitCleanupStarted = false;
+let quitCleanupComplete = false;
+
+app.on("before-quit", (event) => {
+  if (!shortcuts || quitCleanupComplete) return;
+
+  event.preventDefault();
+  if (quitCleanupStarted) return;
+  quitCleanupStarted = true;
+  shortcuts.dispose().finally(() => {
+    quitCleanupComplete = true;
+    app.quit();
+  });
+});
 
 (async () => {
   if (process.platform === "darwin") {
@@ -104,25 +127,27 @@ let tray: AppTray;
         };
         // eslint-disable-next-line no-new
         new OverlayVisibility(eventPipe, overlay, gameConfig);
-        const shortcuts = await Shortcuts.create(
+        const appShortcuts = await Shortcuts.create(
           logger,
           overlay,
           poeWindow,
           gameConfig,
           eventPipe,
         );
+        shortcuts = appShortcuts;
         eventPipe.onEventAnyClient(
           "CLIENT->MAIN::update-host-config",
           (cfg) => {
             overlay.updateOpts(cfg.overlayKey, cfg.windowTitle);
-            shortcuts.updateActions(
+            appShortcuts.updateActions(
               cfg.shortcuts,
               cfg.stashScroll,
               cfg.logKeys,
               cfg.restoreClipboard,
               cfg.language,
+              cfg.windowTitle,
             );
-            shortcuts.updateDelay(cfg.initialDelay);
+            appShortcuts.updateDelay(cfg.initialDelay);
             gameLogWatcher.restart(cfg.clientLog ?? "", cfg.readClientLog);
             gameConfig.readConfig(cfg.gameConfig ?? "");
             appUpdater.checkAtStartup();

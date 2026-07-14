@@ -1,19 +1,20 @@
 publish:
   - "github"
 productName: "Exiled Exchange 2"
+appId: "exiled-exchange-2"
 npmRebuild: false
 files:
   - "package.json"
   - from: "dist"
     to: "."
     filter: ["main.js", "vision.js"]
-  - from: "dist/native"
-    to: "native"
-    filter: ["ee2-wayland-helper"]
   - from: "../renderer/dist"
     to: "."
-asarUnpack:
-  - "native/ee2-wayland-helper"
+extraResources:
+  - from: "native/ee2-uinput.py"
+    to: "native/ee2-uinput.py"
+  - from: "dist/native/ee2-win-clipboard.exe.so"
+    to: "native/ee2-win-clipboard.exe.so"
 extraMetadata:
   main: "main.js"
 nsis:
