@@ -21,6 +21,7 @@ export class ProtonClipboard {
           ...process.env,
           WINEPREFIX: proton.prefix,
           WINEDLLPATH: path.dirname(helper),
+          XDG_DATA_DIRS: proton.xdgDataDirs,
         },
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -82,7 +83,11 @@ async function protonEnvironment(pid: number) {
   if (!prefix || !toolPath) {
     throw new Error("Could not determine the running Proton environment");
   }
-  return { prefix, wine: path.join(toolPath, "files", "bin", "wine") };
+  return {
+    prefix,
+    wine: path.join(toolPath, "files", "bin", "wine"),
+    xdgDataDirs: environment.XDG_DATA_DIRS,
+  };
 }
 
 function helperPath() {

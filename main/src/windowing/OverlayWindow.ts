@@ -7,6 +7,12 @@ import {
 import type { ServerEvents } from "../server";
 import type { Logger } from "../RemoteLogger";
 import type { GameWindow } from "./GameWindow";
+import {
+  focusXWaylandGame,
+  focusXWaylandOverlay,
+  isNativeWayland,
+  setXWaylandOverlayFocusable,
+} from "./platform";
 
 export class OverlayWindow {
   public isInteractable = false;
@@ -44,7 +50,7 @@ export class OverlayWindow {
   private createWindow() {
     if (this.window && !this.window.isDestroyed()) return;
 
-    const waylandBounds = isWayland()
+    const waylandBounds = isNativeWayland()
       ? screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).bounds
       : undefined;
 
@@ -56,7 +62,7 @@ export class OverlayWindow {
       // hints are meaningless on Wayland and can prevent the window from
       // rendering correctly. We use plain transparent window options instead
       // and manage show/hide manually via compositor-backed hotkeys.
-      ...(isWayland()
+      ...(isNativeWayland()
         ? {
             frame: false,
             show: false,
@@ -159,12 +165,15 @@ export class OverlayWindow {
   }
 
   assertOverlayActive = (opts: { force?: boolean } = {}) => {
-    if (isWayland() && this.wasExplicitlyHidden && !opts.force) return;
+    if (isNativeWayland() && this.wasExplicitlyHidden && !opts.force) return;
 
-    if (!this.isInteractable || (isWayland() && !this.window?.isVisible())) {
+    if (
+      !this.isInteractable ||
+      (isNativeWayland() && !this.window?.isVisible())
+    ) {
       this.wasExplicitlyHidden = false;
       this.isInteractable = true;
-      if (isWayland()) {
+      if (isNativeWayland()) {
         const display = screen.getDisplayNearestPoint(
           screen.getCursorScreenPoint(),
         );
@@ -183,7 +192,14 @@ export class OverlayWindow {
         this.emitFocusChange();
         return;
       }
-      OverlayController.activateOverlay();
+      const waitForFocusRule = setXWaylandOverlayFocusable(this.window, true);
+      const activate = () => {
+        if (!this.isInteractable) return;
+        OverlayController.activateOverlay();
+        focusXWaylandOverlay();
+      };
+      if (waitForFocusRule) setTimeout(activate, 50);
+      else activate();
       this.poeWindow.isActive = false;
     }
   };
@@ -191,7 +207,7 @@ export class OverlayWindow {
   assertGameActive = () => {
     if (this.isInteractable) {
       this.isInteractable = false;
-      if (isWayland()) {
+      if (isNativeWayland()) {
         this.wasExplicitlyHidden = true;
         // hide() unmaps the Wayland surface, returning focus to the compositor's
         // previous active window (the game). setIgnoreMouseEvents() is a no-op
@@ -202,6 +218,8 @@ export class OverlayWindow {
         return;
       }
       OverlayController.focusTarget();
+      setXWaylandOverlayFocusable(this.window, false);
+      focusXWaylandGame();
       this.poeWindow.isActive = true;
     }
   };
@@ -212,7 +230,7 @@ export class OverlayWindow {
     this.lastToggleAt = now;
 
     this.isOverlayKeyUsed = true;
-    if (isWayland() && this.wasExplicitlyHidden) {
+    if (isNativeWayland() && this.wasExplicitlyHidden) {
       this.assertOverlayActive({ force: true });
     } else if (this.isInteractable) {
       this.assertGameActive();
@@ -222,7 +240,7 @@ export class OverlayWindow {
   };
 
   suppressNextDeactivate() {
-    if (!isWayland() || !this.isInteractable) return;
+    if (!isNativeWayland() || !this.isInteractable) return;
     this.window?.show();
   }
 
@@ -234,7 +252,11 @@ export class OverlayWindow {
   }
 
   private installWaylandBlurHandler() {
-    if (!isWayland() || !this.window || this.waylandBlurHandlerInstalled)
+    if (
+      !isNativeWayland() ||
+      !this.window ||
+      this.waylandBlurHandlerInstalled
+    )
       return;
 
     this.waylandBlurHandlerInstalled = true;
@@ -307,10 +329,11 @@ export class OverlayWindow {
   };
 
   private handlePoeWindowActiveChange = (isActive: boolean) => {
-    if (isWayland()) return;
+    if (isNativeWayland()) return;
 
     if (isActive && this.isInteractable) {
       this.isInteractable = false;
+      setXWaylandOverlayFocusable(this.window, false);
     }
     this.emitFocusChange(isActive);
   };
@@ -322,17 +345,9 @@ export class OverlayWindow {
         game: isActive,
         overlay: this.isInteractable,
         usingHotkey: this.isOverlayKeyUsed,
-        isWayland: isWayland(),
+        isWayland: isNativeWayland(),
       },
     });
     this.isOverlayKeyUsed = false;
   }
-}
-
-function isWayland(): boolean {
-  return (
-    process.platform === "linux" &&
-    (process.env.XDG_SESSION_TYPE === "wayland" ||
-      Boolean(process.env.WAYLAND_DISPLAY))
-  );
 }

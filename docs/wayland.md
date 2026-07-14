@@ -262,80 +262,36 @@ portal action IDs in their compositor configuration.
 
 ## EE2 overlay pattern on Wayland
 
-### What went wrong and why
+EE2 separates the desktop session from the Electron window backend. Hotkeys,
+active-window checks, and item acquisition use Wayland/Hyprland facilities,
+while the transparent overlay uses XWayland alongside PoE2.
 
-**`electron-overlay-window` calling `showInactive()` on XWayland focus events.**
-`OverlayController.attachByTitle(window, title)` stores a reference to the
-Electron BrowserWindow and registers internal listeners on the library's event
-emitter. When the library's native X11 code detects PoE2 (running under
-XWayland) gaining focus, it calls `this.electronWindow.showInactive()` directly
-— bypassing all application-level guards. On a Wayland session this caused the
-overlay to appear every time PoE2 gained focus, with no way to stop it short of
-not calling `attachByTitle`. Fix: skip `OverlayController.attachByTitle()` on
-Wayland entirely. `GameWindow.attach()` gates the call with `!isWayland()`.
+A regular Electron Wayland `xdg_toplevel` cannot provide the required
+always-visible, click-through surface over a fullscreen XWayland game.
+`setIgnoreMouseEvents()` and `showInactive()` are not supported by Electron's
+native Wayland backend. EE2 therefore launches Electron with
+`--ozone-platform=x11` and lets `electron-overlay-window` attach the overlay to
+the PoE2 X11 window. The installed desktop entry and launcher include this flag
+explicitly because `ELECTRON_OZONE_PLATFORM_HINT` is consumed before
+application JavaScript runs.
 
-**`globalShortcut` registering XWayland grabs.**
-After each `assertGameActive()` call, `poeWindow.isActive` changes to `true`,
-which fires `active-change(true)`, which triggers `Shortcuts.register()`. On
-Wayland this was registering all actions via `globalShortcut`, which uses
-XGrabKey under XWayland and interferes with game input. Fix:
-`Shortcuts.register()` and `unregister()` return early on Wayland; portal
-registration is managed separately.
-
-**`focus()` and `setAlwaysOnTop` toggling causing activation fights.**
-Calling `focus()` after `show()` sends `xdg_activation_v1`. Against a
-fullscreen game this either fails silently (overlay stays unfocused) or
-triggers a brief focus steal that PoE2 immediately reverses — causing the blur
-handler to fire, which hides the overlay, which re-registers shortcuts, which
-re-caused the problem above. Separately, toggling `setAlwaysOnTop` on every
-show/hide call causes KWin to re-evaluate the window's compositor layer on
-each call, which can manifest as a focus event. Fix: `focus()` is not called
-on Wayland; `setAlwaysOnTop` is called once at window creation.
-
-**`moveTop()` and `setIgnoreMouseEvents()` being no-ops.**
-Both were present in earlier iterations of the code. Neither has a Wayland
-code path. Removed.
-
-### The correct Wayland pattern for EE2
-
-**Window creation (once):**
-```typescript
-new BrowserWindow({
-  show: false, frame: false, transparent: true,
-  alwaysOnTop: true, focusable: true, skipTaskbar: true,
-  ...
-})
-window.setAlwaysOnTop(true)           // set once; never toggled
-window.setVisibleOnAllWorkspaces(true) // set once; never toggled
-```
-
-**Open:**
-```typescript
-window.setBounds(display.bounds)
-window.show()   // maps surface; no focus() call — game keeps keyboard focus
-```
-
-**Close:**
-```typescript
-window.hide()   // unmaps surface; compositor returns focus to game
-```
-
-**Hotkeys:** XDG GlobalShortcuts portal. `globalShortcut` is not registered on
-Wayland. After portal registration, EE2 installs temporary non-consuming
-Hyprland bindings with `hyprctl keyword bindn`. It replaces those bindings when
-the configured shortcuts change and removes them during normal shutdown, so no
+On Hyprland, EE2 installs two temporary window rules before creating the
+BrowserWindow. The passive title has `no_focus on`, keeping PoE2 focused while
+the price-check UI remains rendered and click-through. Locked checks and the
+full overlay switch to an interactive title with `no_focus off`, allowing the
+window to receive input; EE2 then focuses the requested window with Hyprland's
+`focuswindow` dispatcher. Returning to the game restores the passive title. No
 manual Hyprland configuration is required.
+
+Hotkeys still use the XDG GlobalShortcuts portal. `globalShortcut` is not
+registered on a Wayland session because its XGrabKey fallback interferes with
+PoE2 input. After portal registration, EE2 installs temporary non-consuming
+Hyprland bindings with `hyprctl keyword bindn`. It replaces those bindings when
+the configured shortcuts change and removes them during normal shutdown.
 
 Portal actions run on key release so the physical trigger modifiers are no
 longer held. Before an action runs, EE2 verifies the active window with
-`hyprctl -j activewindow`. Because PoE2/Proton rejects compositor and XTest
-key injection, item copying uses a narrow persistent uinput keyboard helper.
-The item text is read directly from Proton's Windows clipboard because its
+`hyprctl -j activewindow`. Because PoE2/Proton rejects compositor and XTest key
+injection, item copying uses a narrow persistent uinput keyboard helper. The
+item text is read directly from Proton's Windows clipboard because its
 X11/Wayland clipboard bridge can remain empty.
-
-**Game focus tracking:** `GameWindow._isActive` still tracks EE2's own overlay
-state. Global portal actions do not trust that value: Hyprland's active window
-is checked before they run. `OverlayController` focus/blur events are ignored
-on Wayland because the library's X11 detection is unreliable in a mixed
-Wayland/XWayland session and its `attachByTitle` path would call
-`showInactive()` on the overlay.

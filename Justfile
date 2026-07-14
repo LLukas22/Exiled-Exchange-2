@@ -33,7 +33,7 @@ install-appimage:
     desktop-file-install \
         --dir="$HOME/.local/share/applications" \
         --set-key=Exec \
-        --set-value="$dest" \
+        --set-value="$dest --ozone-platform=x11" \
         main/build/exiled-exchange-2.desktop
     chmod 644 "$desktop"
     update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
@@ -51,7 +51,7 @@ install-appimage:
     export DESKTOP_STARTUP_ID="exiled-exchange-2"
     export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-KDE}"
 
-    exec -a exiled-exchange-2 "$app" --class=exiled-exchange-2 "$@"
+    exec -a exiled-exchange-2 "$app" --class=exiled-exchange-2 --ozone-platform=x11 "$@"
     EOF
     chmod 755 "$launcher"
 

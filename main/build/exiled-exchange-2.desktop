@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Exiled Exchange 2
 Comment=Path of Exile 2 price-check overlay
-Exec=exiled-exchange-2
+Exec=exiled-exchange-2 --ozone-platform=x11
 Terminal=false
 Type=Application
 Icon=exiled-exchange-2

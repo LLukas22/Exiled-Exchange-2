@@ -16,6 +16,10 @@ import { GameLogWatcher } from "./host-files/GameLogWatcher";
 import { HttpProxy } from "./proxy";
 import { installExtension, VUEJS_DEVTOOLS } from "electron-devtools-installer";
 import { FileWriter } from "./host-files/FileWriter";
+import {
+  isWaylandSession,
+  prepareXWaylandOverlay,
+} from "./windowing/platform";
 
 if (!app.requestSingleInstanceLock()) {
   app.exit();
@@ -27,6 +31,14 @@ if (process.platform === "linux") {
   app.setDesktopName("exiled-exchange-2.desktop");
   app.setAppUserModelId("exiled-exchange-2");
   app.commandLine.appendSwitch("class", "exiled-exchange-2");
+  if (
+    isWaylandSession() &&
+    !process.argv.some((arg) => arg.startsWith("--ozone-platform="))
+  ) {
+    // PoE runs through XWayland. Using the same backend lets the native overlay
+    // helper attach the transparent, click-through window above the game.
+    app.commandLine.appendSwitch("ozone-platform", "x11");
+  }
 }
 
 if (process.platform !== "darwin") {
@@ -88,6 +100,9 @@ app.on("before-quit", (event) => {
   app.on("ready", async () => {
     tray = new AppTray(eventPipe);
     const logger = new Logger(eventPipe);
+    if (prepareXWaylandOverlay()) {
+      logger.write("debug [hyprland] installed overlay focus rule");
+    }
     const gameConfig = new GameConfig(eventPipe, logger);
     const poeWindow = new GameWindow();
     const appUpdater = new AppUpdater(eventPipe);
