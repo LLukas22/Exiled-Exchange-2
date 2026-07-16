@@ -88,6 +88,7 @@ export type IpcEvent =
   | IpcLogEntry
   | IpcHostConfig
   | IpcWidgetAction
+  | IpcShowSettings
   | IpcItemText
   | IpcOcrText
   | IpcConfigChanged
@@ -108,6 +109,7 @@ type IpcFocusChange = Event<
     game: boolean;
     overlay: boolean;
     usingHotkey: boolean;
+    isWayland: boolean;
   }
 >;
 
@@ -171,6 +173,8 @@ type IpcWidgetAction = Event<
   }
 >;
 
+type IpcShowSettings = Event<"MAIN->CLIENT::show-settings">;
+
 type IpcItemText = Event<
   "MAIN->CLIENT::item-text",
   {
@@ -178,6 +182,8 @@ type IpcItemText = Event<
     clipboard: string;
     item?: unknown;
     position: { x: number; y: number };
+    side?: "stash" | "inventory";
+    keepOpen?: boolean;
     focusOverlay: boolean;
   }
 >;

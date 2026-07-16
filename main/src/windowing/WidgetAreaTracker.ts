@@ -2,12 +2,14 @@ import { Rectangle, Point, screen } from "electron";
 import { uIOhook, UiohookMouseEvent } from "uiohook-napi";
 import type { OverlayWindow } from "./OverlayWindow";
 import type { ServerEvents } from "../server";
+import { isWaylandSession } from "./platform";
 
 export class WidgetAreaTracker {
   private holdKey!: string;
   private from!: Point;
   private area!: Rectangle;
   private closeThreshold!: number;
+  private isHoldKeyLatched = false;
   constructor(
     private server: ServerEvents,
     private overlay: OverlayWindow,
@@ -58,6 +60,7 @@ export class WidgetAreaTracker {
       }
 
       this.removeListeners();
+      this.isHoldKeyLatched = isWaylandSession();
       uIOhook.addListener("mousemove", this.handleMouseMove);
       uIOhook.addListener("mousedown", this.handleMouseDown);
     });
@@ -66,11 +69,16 @@ export class WidgetAreaTracker {
   removeListeners() {
     uIOhook.removeListener("mousemove", this.handleMouseMove);
     uIOhook.removeListener("mousedown", this.handleMouseDown);
+    this.isHoldKeyLatched = false;
   }
 
   private readonly handleMouseMove = (e: UiohookMouseEvent) => {
     const modifier = e.ctrlKey ? "Ctrl" : e.altKey ? "Alt" : undefined;
-    if (!this.overlay.isInteractable && modifier !== this.holdKey) {
+    if (
+      !this.overlay.isInteractable &&
+      !this.isHoldKeyLatched &&
+      modifier !== this.holdKey
+    ) {
       const distance = Math.hypot(e.x - this.from.x, e.y - this.from.y);
       if (distance > this.closeThreshold) {
         this.server.sendEventTo("broadcast", {
@@ -80,6 +88,7 @@ export class WidgetAreaTracker {
         this.removeListeners();
       }
     } else if (isPointInsideRect(e, this.area)) {
+      this.isHoldKeyLatched = false;
       this.overlay.assertOverlayActive();
     } else if (this.overlay.isInteractable) {
       this.removeListeners();
@@ -91,6 +100,12 @@ export class WidgetAreaTracker {
     if (isPointInsideRect(e, this.area)) {
       this.removeListeners();
       this.overlay.assertOverlayActive();
+    } else if (!this.overlay.isInteractable && this.isHoldKeyLatched) {
+      this.server.sendEventTo("broadcast", {
+        name: "MAIN->OVERLAY::hide-exclusive-widget",
+        payload: undefined,
+      });
+      this.removeListeners();
     }
   };
 }

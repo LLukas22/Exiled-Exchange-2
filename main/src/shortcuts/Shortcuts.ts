@@ -1,4 +1,9 @@
 import { screen, globalShortcut } from "electron";
+import {
+  WaylandPortalShortcuts,
+  type PortalShortcutEvent,
+} from "./WaylandPortalShortcuts";
+import { Hyprland } from "./Hyprland";
 import { uIOhook, UiohookKey, UiohookWheelEvent } from "uiohook-napi";
 import {
   isModKey,
@@ -17,6 +22,8 @@ import type { GameConfig } from "../host-files/GameConfig";
 import type { ServerEvents } from "../server";
 
 type UiohookKeyT = keyof typeof UiohookKey;
+type CopyItemAction = Extract<ShortcutAction["action"], { type: "copy-item" }>;
+
 const UiohookToName = Object.fromEntries(
   Object.entries(UiohookKey).map(([k, v]) => [v, k]),
 );
@@ -27,6 +34,11 @@ export class Shortcuts {
   private logKeys = false;
   private areaTracker: WidgetAreaTracker;
   private clipboard: HostClipboard;
+  private portalHelper?: WaylandPortalShortcuts;
+  private portalHotkeysKey: string | null = null;
+  private portalSync = Promise.resolve();
+  private hyprland = new Hyprland();
+  private waylandCopyPending = false;
 
   static async create(
     logger: Logger,
@@ -107,17 +119,33 @@ export class Shortcuts {
     this.clipboard.updateDelay(delay);
   }
 
+  async dispose() {
+    this.portalHotkeysKey = null;
+    await this.portalSync.catch(() => {});
+    this.portalHelper?.stop();
+    this.portalHelper = undefined;
+    try {
+      await this.hyprland.clearGlobalBinds();
+    } catch (error) {
+      this.logger.write(
+        `error [hyprland] failed to remove temporary binds: ${(error as Error).message}`,
+      );
+    }
+  }
+
   updateActions(
     actions: ShortcutAction[],
     stashScroll: boolean,
     logKeys: boolean,
     restoreClipboard: boolean,
     language: string,
+    windowTitle: string,
   ) {
     this.stashScroll = stashScroll;
     this.logKeys = logKeys;
     this.clipboard.updateOptions(restoreClipboard);
     this.ocrWorker.updateOptions(language);
+    this.hyprland.updateWindowTitle(windowTitle);
 
     const copyItemShortcut = mergeTwoHotkeys(
       "Ctrl + C",
@@ -173,19 +201,21 @@ export class Shortcuts {
         !duplicates.has(action.shortcut) ||
         action.action.type === "toggle-overlay",
     );
+    this.syncWaylandHotkeys();
+    if (this.poeWindow.isActive) {
+      this.unregister();
+      this.register();
+    }
   }
 
   private register() {
+    // On Wayland, globalShortcut uses XGrabKey via XWayland and interferes with
+    // PoE2's own input handling. The GlobalShortcuts portal is used instead.
+    if (isWayland()) return;
     for (const entry of this.actions) {
       const isOk = globalShortcut.register(
         shortcutToElectron(entry.shortcut),
         () => {
-          if (this.logKeys) {
-            this.logger.write(
-              `debug [Shortcuts] Action type: ${entry.action.type}`,
-            );
-          }
-
           if (entry.keepModKeys) {
             const nonModKey = entry.shortcut
               .split(" + ")
@@ -199,77 +229,7 @@ export class Shortcuts {
                 uIOhook.keyToggle(UiohookKey[key as UiohookKeyT], "up");
               });
           }
-
-          if (entry.action.type === "toggle-overlay") {
-            this.areaTracker.removeListeners();
-            this.overlay.toggleActiveState();
-          } else if (entry.action.type === "paste-in-chat") {
-            typeInChat(entry.action.text, entry.action.send, this.clipboard);
-          } else if (entry.action.type === "trigger-event") {
-            this.server.sendEventTo("broadcast", {
-              name: "MAIN->CLIENT::widget-action",
-              payload: { target: entry.action.target },
-            });
-          } else if (entry.action.type === "stash-search") {
-            stashSearch(entry.action.text, this.clipboard, this.overlay);
-          } else if (entry.action.type === "copy-item") {
-            const { action } = entry;
-
-            const pressPosition = screen.getCursorScreenPoint();
-
-            this.clipboard
-              .readItemText()
-              .then((clipboard) => {
-                this.areaTracker.removeListeners();
-                this.server.sendEventTo("last-active", {
-                  name: "MAIN->CLIENT::item-text",
-                  payload: {
-                    target: action.target,
-                    clipboard,
-                    position: pressPosition,
-                    focusOverlay: Boolean(action.focusOverlay),
-                  },
-                });
-                if (action.focusOverlay && this.overlay.wasUsedRecently) {
-                  this.overlay.assertOverlayActive();
-                }
-              })
-              .catch(() => {});
-
-            pressKeysToCopyItemText(
-              entry.keepModKeys
-                ? entry.shortcut.split(" + ").filter((key) => isModKey(key))
-                : undefined,
-              this.gameConfig.showModsKey,
-            );
-          } else if (
-            entry.action.type === "ocr-text" &&
-            entry.action.target === "heist-gems"
-          ) {
-            if (process.platform !== "win32") return;
-
-            const { action } = entry;
-            const pressTime = Date.now();
-            const imageData = this.poeWindow.screenshot();
-            this.ocrWorker
-              .findHeistGems({
-                width: this.poeWindow.bounds.width,
-                height: this.poeWindow.bounds.height,
-                data: imageData,
-              })
-              .then((result) => {
-                this.server.sendEventTo("last-active", {
-                  name: "MAIN->CLIENT::ocr-text",
-                  payload: {
-                    target: action.target,
-                    pressTime,
-                    ocrTime: result.elapsed,
-                    paragraphs: result.recognized.map((p) => p.text),
-                  },
-                });
-              })
-              .catch(() => {});
-          }
+          this.runAction(entry);
         },
       );
 
@@ -286,8 +246,301 @@ export class Shortcuts {
   }
 
   private unregister() {
+    if (isWayland()) return;
     globalShortcut.unregisterAll();
   }
+
+  private syncWaylandHotkeys(actions = this.actions) {
+    if (!isWayland()) return;
+
+    const eligible = actions.filter((a) => a.action.type !== "test-only");
+    const idCounts = new Map<string, number>();
+    const registered = eligible.map((action) => {
+      const baseId = portalActionId(action);
+      const count = idCounts.get(baseId) ?? 0;
+      idCounts.set(baseId, count + 1);
+      return {
+        action,
+        hotkey: {
+          id: count ? `${baseId}-${count + 1}` : baseId,
+          accelerator: action.shortcut,
+        },
+      };
+    });
+    const hotkeys = registered.map(({ hotkey }) => hotkey);
+    const hotkeysKey = JSON.stringify(hotkeys);
+    if (hotkeysKey === this.portalHotkeysKey) return;
+
+    this.portalHotkeysKey = hotkeysKey;
+    const portalActions = new Map(
+      registered.map(({ action, hotkey }) => [hotkey.id, action]),
+    );
+    this.portalSync = this.portalSync
+      .catch(() => {})
+      .then(async () => {
+        if (hotkeysKey !== this.portalHotkeysKey) return;
+
+        try {
+          await this.hyprland.clearGlobalBinds();
+        } catch (error) {
+          if (hotkeysKey === this.portalHotkeysKey) {
+            this.portalHotkeysKey = null;
+          }
+          this.logger.write(
+            `error [hyprland] failed to remove temporary binds: ${(error as Error).message}`,
+          );
+          return;
+        }
+        this.portalHelper?.stop();
+        this.portalHelper = undefined;
+        if (!hotkeys.length) return;
+
+        const portal = new WaylandPortalShortcuts();
+        portal.on("event", (event) => {
+          if (event.type === "error") {
+            this.logger.write(`error [wayland-portal] ${event.message}`);
+          } else if (event.type === "debug") {
+            this.logger.write(`debug [wayland-portal] ${event.message}`);
+          } else {
+            this.handleWaylandHotkeyEvent(event, portalActions).catch(
+              (error) => {
+                this.logger.write(
+                  `error [wayland-portal] ${(error as Error).message}`,
+                );
+              },
+            );
+          }
+        });
+
+        try {
+          await portal.start(hotkeys);
+        } catch (error) {
+          await this.hyprland.clearGlobalBinds().catch(() => {});
+          if (hotkeysKey === this.portalHotkeysKey) {
+            this.portalHotkeysKey = null;
+          }
+          this.logger.write(
+            `error [wayland-portal] GlobalShortcuts unavailable: ${(error as Error).message}`,
+          );
+          return;
+        }
+        if (hotkeysKey !== this.portalHotkeysKey) {
+          portal.stop();
+          return;
+        }
+
+        try {
+          await this.hyprland.replaceGlobalBinds(hotkeys);
+        } catch (error) {
+          portal.stop();
+          if (hotkeysKey === this.portalHotkeysKey) {
+            this.portalHotkeysKey = null;
+          }
+          this.logger.write(
+            `error [hyprland] failed to install temporary binds: ${(error as Error).message}`,
+          );
+          return;
+        }
+        if (hotkeysKey !== this.portalHotkeysKey) {
+          await this.hyprland.clearGlobalBinds().catch(() => {});
+          portal.stop();
+          return;
+        }
+
+        this.portalHelper = portal;
+        this.logger.write(
+          `info [hyprland] installed ${hotkeys.length} temporary non-consuming binds`,
+        );
+      });
+  }
+
+  private async handleWaylandHotkeyEvent(
+    event: PortalShortcutEvent,
+    actions: Map<string, ShortcutAction>,
+  ) {
+    if (event.type !== "hotkey" || event.state !== "released") return;
+
+    const entry = actions.get(event.id);
+    if (!entry) return;
+    if (this.logKeys) {
+      this.logger.write(
+        `debug [wayland-portal] Hotkey released ${event.accelerator}`,
+      );
+    }
+
+    if (this.overlay.isInteractable) {
+      if (entry.action.type === "toggle-overlay") this.runAction(entry);
+      return;
+    }
+    if (await this.hyprland.isGameActive()) {
+      this.runAction(entry);
+    }
+  }
+
+  private runAction(entry: ShortcutAction) {
+    if (this.logKeys) {
+      this.logger.write(`debug [Shortcuts] Action type: ${entry.action.type}`);
+    }
+    if (entry.action.type === "toggle-overlay") {
+      this.areaTracker.removeListeners();
+      this.overlay.toggleActiveState();
+    } else if (entry.action.type === "paste-in-chat") {
+      typeInChat(entry.action.text, entry.action.send, this.clipboard);
+    } else if (entry.action.type === "trigger-event") {
+      this.server.sendEventTo("broadcast", {
+        name: "MAIN->CLIENT::widget-action",
+        payload: { target: entry.action.target },
+      });
+    } else if (entry.action.type === "stash-search") {
+      stashSearch(entry.action.text, this.clipboard, this.overlay);
+    } else if (entry.action.type === "copy-item") {
+      const { action } = entry;
+      const pressPosition = screen.getCursorScreenPoint();
+      if (isWayland()) {
+        this.handleWaylandCopyItem(action, pressPosition).catch((error) => {
+          this.logger.write(
+            `error [hyprland] copy failed: ${(error as Error).message}`,
+          );
+        });
+      } else {
+        this.clipboard
+          .readItemText()
+          .then((clipboard) => {
+            this.emitItemText(action, clipboard, pressPosition);
+          })
+          .catch(() => {});
+        pressKeysToCopyItemText(
+          entry.keepModKeys
+            ? entry.shortcut.split(" + ").filter((key) => isModKey(key))
+            : undefined,
+          this.gameConfig.showModsKey,
+        );
+      }
+    } else if (
+      entry.action.type === "ocr-text" &&
+      entry.action.target === "heist-gems"
+    ) {
+      if (process.platform !== "win32") return;
+      const { action } = entry;
+      const pressTime = Date.now();
+      const imageData = this.poeWindow.screenshot();
+      this.ocrWorker
+        .findHeistGems({
+          width: this.poeWindow.bounds.width,
+          height: this.poeWindow.bounds.height,
+          data: imageData,
+        })
+        .then((result) => {
+          this.server.sendEventTo("last-active", {
+            name: "MAIN->CLIENT::ocr-text",
+            payload: {
+              target: action.target,
+              pressTime,
+              ocrTime: result.elapsed,
+              paragraphs: result.recognized.map((p) => p.text),
+            },
+          });
+        })
+        .catch(() => {});
+    }
+  }
+
+  private async handleWaylandCopyItem(
+    action: CopyItemAction,
+    pressPosition: { x: number; y: number },
+  ) {
+    if (this.waylandCopyPending) return;
+    this.waylandCopyPending = true;
+    const startedAt = Date.now();
+    try {
+      const capture = await this.hyprland.copyItemText(
+        mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
+        this.clipboard.restoreEnabled,
+      );
+      const keepOpen = action.target === "price-check" && !action.focusOverlay;
+      this.emitItemText(action, capture.clipboard, pressPosition, {
+        side: capture.side,
+        keepOpen,
+      });
+      if (this.logKeys) {
+        this.logger.write(
+          `debug [hyprland] captured ${capture.clipboard.length} item-text characters in ${Date.now() - startedAt}ms, side=${capture.side ?? "unknown"}`,
+        );
+      }
+    } finally {
+      this.waylandCopyPending = false;
+    }
+  }
+
+  private emitItemText(
+    action: CopyItemAction,
+    clipboard: string,
+    pressPosition: { x: number; y: number },
+    opts: {
+      side?: "stash" | "inventory";
+      keepOpen?: boolean;
+    } = {},
+  ) {
+    this.areaTracker.removeListeners();
+    this.server.sendEventTo("last-active", {
+      name: "MAIN->CLIENT::item-text",
+      payload: {
+        target: action.target,
+        clipboard,
+        position: pressPosition,
+        side: opts.side,
+        keepOpen: opts.keepOpen,
+        focusOverlay: Boolean(action.focusOverlay),
+      },
+    });
+    if (
+      (action.focusOverlay || opts.keepOpen) &&
+      this.overlay.wasUsedRecently
+    ) {
+      this.overlay.assertOverlayActive();
+    }
+  }
+}
+
+function portalActionId(entry: ShortcutAction) {
+  const action = entry.action;
+  if (action.type === "toggle-overlay") return "toggle-overlay";
+  if (action.type === "copy-item") {
+    return `copy-${slug(action.target)}${action.focusOverlay ? "-locked" : ""}`;
+  }
+  if (action.type === "trigger-event") return `event-${slug(action.target)}`;
+  if (action.type === "ocr-text") return `ocr-${slug(action.target)}`;
+  if (action.type === "stash-search") {
+    return `stash-search-${shortHash(action.text)}`;
+  }
+  if (action.type === "paste-in-chat") {
+    return `chat-command-${shortHash(`${action.text}:${action.send}`)}`;
+  }
+  return "test-only";
+}
+
+function slug(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function shortHash(value: string) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function isWayland(): boolean {
+  return (
+    process.platform === "linux" &&
+    (process.env.XDG_SESSION_TYPE === "wayland" ||
+      Boolean(process.env.WAYLAND_DISPLAY))
+  );
 }
 
 function pressKeysToCopyItemText(

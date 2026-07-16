@@ -16,9 +16,26 @@ import { GameLogWatcher } from "./host-files/GameLogWatcher";
 import { HttpProxy } from "./proxy";
 import { installExtension, VUEJS_DEVTOOLS } from "electron-devtools-installer";
 import { FileWriter } from "./host-files/FileWriter";
+import { isWaylandSession, prepareXWaylandOverlay } from "./windowing/platform";
 
 if (!app.requestSingleInstanceLock()) {
   app.exit();
+}
+
+if (process.platform === "linux") {
+  process.env.CHROME_DESKTOP = "exiled-exchange-2.desktop";
+  app.setName("exiled-exchange-2");
+  app.setDesktopName("exiled-exchange-2.desktop");
+  app.setAppUserModelId("exiled-exchange-2");
+  app.commandLine.appendSwitch("class", "exiled-exchange-2");
+  if (
+    isWaylandSession() &&
+    !process.argv.some((arg) => arg.startsWith("--ozone-platform="))
+  ) {
+    // PoE runs through XWayland. Using the same backend lets the native overlay
+    // helper attach the transparent, click-through window above the game.
+    app.commandLine.appendSwitch("ozone-platform", "x11");
+  }
 }
 
 if (process.platform !== "darwin") {
@@ -26,6 +43,21 @@ if (process.platform !== "darwin") {
 }
 app.enableSandbox();
 let tray: AppTray;
+let shortcuts: Shortcuts | undefined;
+let quitCleanupStarted = false;
+let quitCleanupComplete = false;
+
+app.on("before-quit", (event) => {
+  if (!shortcuts || quitCleanupComplete) return;
+
+  event.preventDefault();
+  if (quitCleanupStarted) return;
+  quitCleanupStarted = true;
+  shortcuts.dispose().finally(() => {
+    quitCleanupComplete = true;
+    app.quit();
+  });
+});
 
 (async () => {
   if (process.platform === "darwin") {
@@ -65,6 +97,9 @@ let tray: AppTray;
   app.on("ready", async () => {
     tray = new AppTray(eventPipe);
     const logger = new Logger(eventPipe);
+    if (prepareXWaylandOverlay()) {
+      logger.write("debug [hyprland] installed overlay focus rule");
+    }
     const gameConfig = new GameConfig(eventPipe, logger);
     const poeWindow = new GameWindow();
     const appUpdater = new AppUpdater(eventPipe);
@@ -92,27 +127,39 @@ let tray: AppTray;
     setTimeout(
       async () => {
         const overlay = new OverlayWindow(eventPipe, logger, poeWindow);
+        tray.suppressOverlayHide = () => {
+          overlay.suppressNextDeactivate();
+        };
+        tray.openSettings = () => {
+          overlay.assertOverlayActive({ force: true });
+          eventPipe.sendEventTo("broadcast", {
+            name: "MAIN->CLIENT::show-settings",
+            payload: undefined,
+          });
+        };
         // eslint-disable-next-line no-new
         new OverlayVisibility(eventPipe, overlay, gameConfig);
-        const shortcuts = await Shortcuts.create(
+        const appShortcuts = await Shortcuts.create(
           logger,
           overlay,
           poeWindow,
           gameConfig,
           eventPipe,
         );
+        shortcuts = appShortcuts;
         eventPipe.onEventAnyClient(
           "CLIENT->MAIN::update-host-config",
           (cfg) => {
             overlay.updateOpts(cfg.overlayKey, cfg.windowTitle);
-            shortcuts.updateActions(
+            appShortcuts.updateActions(
               cfg.shortcuts,
               cfg.stashScroll,
               cfg.logKeys,
               cfg.restoreClipboard,
               cfg.language,
+              cfg.windowTitle,
             );
-            shortcuts.updateDelay(cfg.initialDelay);
+            appShortcuts.updateDelay(cfg.initialDelay);
             gameLogWatcher.restart(cfg.clientLog ?? "", cfg.readClientLog);
             gameConfig.readConfig(cfg.gameConfig ?? "");
             appUpdater.checkAtStartup();

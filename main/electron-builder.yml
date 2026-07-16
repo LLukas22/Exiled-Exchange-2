@@ -1,6 +1,8 @@
 publish:
-  - "github"
+  - provider: "github"
+    releaseType: "draft"
 productName: "Exiled Exchange 2"
+appId: "exiled-exchange-2"
 npmRebuild: false
 files:
   - "package.json"
@@ -21,6 +23,11 @@ win:
 linux:
   target:
     - "AppImage"
+  extraResources:
+    - from: "native/ee2-uinput.py"
+      to: "native/ee2-uinput.py"
+    - from: "dist/native/ee2-win-clipboard.exe"
+      to: "native/ee2-win-clipboard.exe"
 mac:
   target:
     - target: "dmg"

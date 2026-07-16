@@ -167,6 +167,7 @@ import {
   nextTick,
   provide,
   ref,
+  onBeforeUnmount,
 } from "vue";
 import { Result, ok, err } from "neverthrow";
 import { useI18n } from "vue-i18n";
@@ -300,6 +301,7 @@ export default defineComponent({
     });
 
     const item = shallowRef<null | Result<ParsedItem, ParseError>>(null);
+    const itemSide = shallowRef<"stash" | "inventory" | undefined>();
     const rebuildKey = shallowRef(2);
     const advancedCheck = shallowRef(false);
     const checkPosition = shallowRef({ x: 1, y: 1 });
@@ -315,7 +317,7 @@ export default defineComponent({
       if (e.target !== "price-check") return;
       performance.mark("price-check-event");
 
-      if (Host.isElectron && !e.focusOverlay) {
+      if (Host.isElectron && !e.focusOverlay && !e.keepOpen) {
         // everything in CSS pixels
         const width = 28.75 * AppConfig().fontSize;
         const screenX =
@@ -344,6 +346,7 @@ export default defineComponent({
       closeBrowser();
       wm.show(props.config.wmId);
       checkPosition.value = e.position;
+      itemSide.value = e.side;
       advancedCheck.value = e.focusOverlay;
       performance.mark("price-check-start-handling-item");
       item.value = handleItemPaste({
@@ -392,8 +395,19 @@ export default defineComponent({
       item.value = ok(identified);
     }
 
-    MainProcess.onEvent("MAIN->OVERLAY::hide-exclusive-widget", () => {
+    function resetPriceCheck() {
+      closeBrowser();
+      item.value = null;
+      itemEditorOptions.value = {
+        editing: false,
+        value: "None",
+        disabled: true,
+      };
       wm.hide(props.config.wmId);
+    }
+
+    MainProcess.onEvent("MAIN->OVERLAY::hide-exclusive-widget", () => {
+      resetPriceCheck();
     });
 
     watch(
@@ -424,9 +438,12 @@ export default defineComponent({
       if (isBrowserShown.value) {
         return "inventory";
       } else {
-        return checkPosition.value.x > window.screenX + window.innerWidth / 2
-          ? "inventory"
-          : "stash";
+        return (
+          itemSide.value ||
+          (checkPosition.value.x > window.screenX + window.innerWidth / 2
+            ? "inventory"
+            : "stash")
+        );
         // or {chat, vendor, center of screen}
       }
     });
@@ -442,20 +459,34 @@ export default defineComponent({
     });
 
     function closePriceCheck() {
-      if (AppConfig().overlayAlwaysClose) {
-        Host.sendEvent({
-          name: "OVERLAY->MAIN::focus-game",
-          payload: undefined,
-        });
-      } else if (isBrowserShown.value || !Host.isElectron) {
-        wm.hide(props.config.wmId);
-      } else {
+      const wasBrowserShown = isBrowserShown.value;
+      resetPriceCheck();
+
+      if (
+        Host.isElectron &&
+        (AppConfig().overlayAlwaysClose || !wasBrowserShown)
+      ) {
         Host.sendEvent({
           name: "OVERLAY->MAIN::focus-game",
           payload: undefined,
         });
       }
     }
+
+    function handleKeydown(e: KeyboardEvent) {
+      if (props.config.wmWants !== "show") return;
+      if (e.key !== "Escape" && !(e.ctrlKey && e.key.toLowerCase() === "w")) {
+        return;
+      }
+
+      e.preventDefault();
+      closePriceCheck();
+    }
+
+    window.addEventListener("keydown", handleKeydown);
+    onBeforeUnmount(() => {
+      window.removeEventListener("keydown", handleKeydown);
+    });
 
     function openLeagueSelection() {
       const settings = wm.widgets.value.find((w) => w.wmType === "settings")!;

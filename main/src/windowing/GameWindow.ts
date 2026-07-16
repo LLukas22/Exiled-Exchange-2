@@ -1,12 +1,13 @@
 import type { BrowserWindow } from "electron";
 import { EventEmitter } from "events";
 import { OverlayController, AttachEvent } from "electron-overlay-window";
+import { isNativeWayland } from "./platform";
 
 export interface GameWindow {
   on: (event: "active-change", listener: (isActive: boolean) => void) => this;
 }
 export class GameWindow extends EventEmitter {
-  private _isActive = false;
+  private _isActive = isNativeWayland();
   private _isTracking = false;
 
   get bounds() {
@@ -33,14 +34,16 @@ export class GameWindow extends EventEmitter {
   attach(window: BrowserWindow | undefined, title: string) {
     if (!this._isTracking) {
       OverlayController.events.on("focus", () => {
-        this.isActive = true;
+        if (!isNativeWayland()) this.isActive = true;
       });
       OverlayController.events.on("blur", () => {
-        this.isActive = false;
+        if (!isNativeWayland()) this.isActive = false;
       });
-      OverlayController.attachByTitle(window, title, {
-        hasTitleBarOnMac: true,
-      });
+      if (!isNativeWayland()) {
+        OverlayController.attachByTitle(window, title, {
+          hasTitleBarOnMac: true,
+        });
+      }
       this._isTracking = true;
     }
   }
