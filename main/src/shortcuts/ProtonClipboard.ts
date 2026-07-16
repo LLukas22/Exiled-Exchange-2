@@ -39,12 +39,7 @@ export class ProtonClipboard {
 
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const text = await runHelper(
-          proton,
-          helper,
-          triggerCopy,
-          restore,
-        );
+        const text = await runHelper(proton, helper, triggerCopy, restore);
         if (!isPoeItemText(text)) {
           throw new RetryableCaptureError(
             "Proton clipboard helper returned invalid item text",
@@ -79,9 +74,7 @@ async function runHelper(
       ...process.env,
       WINEPREFIX: proton.prefix,
       WINEDEBUG: "-all",
-      ...(proton.xdgDataDirs
-        ? { XDG_DATA_DIRS: proton.xdgDataDirs }
-        : {}),
+      ...(proton.xdgDataDirs ? { XDG_DATA_DIRS: proton.xdgDataDirs } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -175,9 +168,7 @@ async function runHelper(
         try {
           resolve(
             UTF8_DECODER.decode(
-              Buffer.concat(stdout, stdoutBytes).subarray(
-                READY_MARKER.length,
-              ),
+              Buffer.concat(stdout, stdoutBytes).subarray(READY_MARKER.length),
             ),
           );
         } catch (error) {
@@ -252,7 +243,9 @@ async function protonEnvironment(pid: number) {
     fs.access(resolvedPrefix, constants.R_OK),
     fs.access(wine, constants.X_OK),
   ]).catch((error: unknown) => {
-    throw new Error(`Proton environment is unavailable: ${errorMessage(error)}`);
+    throw new Error(
+      `Proton environment is unavailable: ${errorMessage(error)}`,
+    );
   });
   return {
     prefix: resolvedPrefix,

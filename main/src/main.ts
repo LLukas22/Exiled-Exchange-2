@@ -16,10 +16,7 @@ import { GameLogWatcher } from "./host-files/GameLogWatcher";
 import { HttpProxy } from "./proxy";
 import { installExtension, VUEJS_DEVTOOLS } from "electron-devtools-installer";
 import { FileWriter } from "./host-files/FileWriter";
-import {
-  isWaylandSession,
-  prepareXWaylandOverlay,
-} from "./windowing/platform";
+import { isWaylandSession, prepareXWaylandOverlay } from "./windowing/platform";
 
 if (!app.requestSingleInstanceLock()) {
   app.exit();

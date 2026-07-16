@@ -153,9 +153,7 @@ function itemSide(
   cursor: HyprlandCursorPosition,
 ): "stash" | "inventory" | undefined {
   if (!window.at || !window.size) return undefined;
-  return cursor.x > window.at[0] + window.size[0] / 2
-    ? "inventory"
-    : "stash";
+  return cursor.x > window.at[0] + window.size[0] / 2 ? "inventory" : "stash";
 }
 
 function xdotoolShortcut(accelerator: string) {

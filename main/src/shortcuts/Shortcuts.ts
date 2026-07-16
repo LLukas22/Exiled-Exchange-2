@@ -493,7 +493,10 @@ export class Shortcuts {
         focusOverlay: Boolean(action.focusOverlay),
       },
     });
-    if ((action.focusOverlay || opts.keepOpen) && this.overlay.wasUsedRecently) {
+    if (
+      (action.focusOverlay || opts.keepOpen) &&
+      this.overlay.wasUsedRecently
+    ) {
       this.overlay.assertOverlayActive();
     }
   }
