@@ -1,5 +1,6 @@
 publish:
-  - "github"
+  - provider: "github"
+    releaseType: "draft"
 productName: "Exiled Exchange 2"
 appId: "exiled-exchange-2"
 npmRebuild: false

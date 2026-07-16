@@ -21,8 +21,12 @@ export function buildWineClipboard () {
   if (result.error) throw result.error
   if (result.status !== 0) throw new Error(`Rust Wine clipboard build failed with exit code ${result.status}`)
 
+  const output = path.join(outDir, 'ee2-win-clipboard.exe')
   fs.copyFileSync(
     path.resolve('native/wine-clipboard/target', target, 'release', 'ee2-win-clipboard.exe'),
-    path.join(outDir, 'ee2-win-clipboard.exe')
+    output
   )
+  if (fs.readFileSync(output).subarray(0, 2).toString('ascii') !== 'MZ') {
+    throw new Error('Rust Wine clipboard build did not produce a Windows PE executable')
+  }
 }

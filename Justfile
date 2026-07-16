@@ -22,8 +22,8 @@ install-appimage:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    src="main/dist/Exiled Exchange 2-0.15.8.AppImage"
-    dest="$HOME/Applications/Exiled-Exchange-2-0.15.8.AppImage"
+    src="main/dist/Exiled Exchange 2-0.15.9.AppImage"
+    dest="$HOME/Applications/Exiled-Exchange-2-0.15.9.AppImage"
     desktop="$HOME/.local/share/applications/exiled-exchange-2.desktop"
     launcher="$HOME/.local/bin/exiled-exchange-2"
 
@@ -42,7 +42,7 @@ install-appimage:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    app="$HOME/Applications/Exiled-Exchange-2-0.15.8.AppImage"
+    app="$HOME/Applications/Exiled-Exchange-2-0.15.9.AppImage"
     desktop_file="$HOME/.local/share/applications/exiled-exchange-2.desktop"
 
     export GIO_LAUNCHED_DESKTOP_FILE="$desktop_file"
