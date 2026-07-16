@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { UinputCopy } from "./UinputCopy";
 import { ProtonClipboard } from "./ProtonClipboard";
 
 const HYPRCTL_TIMEOUT = 2000;
@@ -7,10 +6,17 @@ const POE2_STEAM_CLASS = "steam_app_2694490";
 
 interface HyprlandWindow {
   address?: string;
+  at?: [number, number];
   class?: string;
+  size?: [number, number];
   title?: string;
   xwayland?: boolean;
   pid?: number;
+}
+
+interface HyprlandCursorPosition {
+  x: number;
+  y: number;
 }
 
 export interface HyprlandGlobalHotkey {
@@ -25,7 +31,6 @@ interface RuntimeBind {
 
 export class Hyprland {
   private runtimeBinds: RuntimeBind[] = [];
-  private uinputCopy = new UinputCopy();
   private protonClipboard = new ProtonClipboard();
 
   constructor(private windowTitle = "Path of Exile 2") {}
@@ -44,13 +49,19 @@ export class Hyprland {
       throw new Error("Path of Exile 2 is not the active Hyprland window");
     }
 
-    return await this.protonClipboard.capture(
+    const cursor = await this.cursorPosition().catch(() => undefined);
+    const clipboard = await this.protonClipboard.capture(
       window.pid,
       async () => {
-        await this.uinputCopy.sendShortcut(accelerator);
+        await this.sendX11Shortcut(accelerator);
       },
       restoreClipboard,
     );
+
+    return {
+      clipboard,
+      side: cursor ? itemSide(window, cursor) : undefined,
+    };
   }
 
   async replaceGlobalBinds(hotkeys: HyprlandGlobalHotkey[]) {
@@ -103,10 +114,6 @@ export class Hyprland {
     }
   }
 
-  stopInputHelper() {
-    this.uinputCopy.stop();
-  }
-
   private async activeGameWindow() {
     const output = await runHyprctl(["-j", "activewindow"]);
     const window = JSON.parse(output) as HyprlandWindow;
@@ -115,6 +122,54 @@ export class Hyprland {
       (window.xwayland === true && window.title === this.windowTitle);
     return isPoe2 ? window : null;
   }
+
+  private async cursorPosition() {
+    const output = await runHyprctl(["-j", "cursorpos"]);
+    return JSON.parse(output) as HyprlandCursorPosition;
+  }
+
+  private async sendX11Shortcut(accelerator: string) {
+    const output = await runCommand("xdotool", [
+      "search",
+      "--onlyvisible",
+      "--class",
+      POE2_STEAM_CLASS,
+    ]);
+    const windowId = output.trim().split("\n").filter(Boolean).at(-1);
+    if (!windowId) throw new Error("Could not find the PoE2 XWayland window");
+
+    await runCommand("xdotool", [
+      "key",
+      "--window",
+      windowId,
+      "--clearmodifiers",
+      xdotoolShortcut(accelerator),
+    ]);
+  }
+}
+
+function itemSide(
+  window: HyprlandWindow,
+  cursor: HyprlandCursorPosition,
+): "stash" | "inventory" | undefined {
+  if (!window.at || !window.size) return undefined;
+  return cursor.x > window.at[0] + window.size[0] / 2
+    ? "inventory"
+    : "stash";
+}
+
+function xdotoolShortcut(accelerator: string) {
+  const names: Record<string, string> = {
+    Ctrl: "ctrl",
+    Alt: "alt",
+    Shift: "shift",
+    Meta: "super",
+    Super: "super",
+  };
+  return accelerator
+    .split(" + ")
+    .map((key) => names[key] ?? key.toLowerCase())
+    .join("+");
 }
 
 function splitShortcut(accelerator: string) {

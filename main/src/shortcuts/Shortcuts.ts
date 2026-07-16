@@ -124,7 +124,6 @@ export class Shortcuts {
     await this.portalSync.catch(() => {});
     this.portalHelper?.stop();
     this.portalHelper = undefined;
-    this.hyprland.stopInputHelper();
     try {
       await this.hyprland.clearGlobalBinds();
     } catch (error) {
@@ -452,12 +451,22 @@ export class Shortcuts {
   ) {
     if (this.waylandCopyPending) return;
     this.waylandCopyPending = true;
+    const startedAt = Date.now();
     try {
-      const clipboard = await this.hyprland.copyItemText(
+      const capture = await this.hyprland.copyItemText(
         mergeTwoHotkeys("Ctrl + C", this.gameConfig.showModsKey),
         this.clipboard.restoreEnabled,
       );
-      this.emitItemText(action, clipboard, pressPosition);
+      const keepOpen = action.target === "price-check" && !action.focusOverlay;
+      this.emitItemText(action, capture.clipboard, pressPosition, {
+        side: capture.side,
+        keepOpen,
+      });
+      if (this.logKeys) {
+        this.logger.write(
+          `debug [hyprland] captured ${capture.clipboard.length} item-text characters in ${Date.now() - startedAt}ms, side=${capture.side ?? "unknown"}`,
+        );
+      }
     } finally {
       this.waylandCopyPending = false;
     }
@@ -467,6 +476,10 @@ export class Shortcuts {
     action: CopyItemAction,
     clipboard: string,
     pressPosition: { x: number; y: number },
+    opts: {
+      side?: "stash" | "inventory";
+      keepOpen?: boolean;
+    } = {},
   ) {
     this.areaTracker.removeListeners();
     this.server.sendEventTo("last-active", {
@@ -475,10 +488,12 @@ export class Shortcuts {
         target: action.target,
         clipboard,
         position: pressPosition,
+        side: opts.side,
+        keepOpen: opts.keepOpen,
         focusOverlay: Boolean(action.focusOverlay),
       },
     });
-    if (action.focusOverlay && this.overlay.wasUsedRecently) {
+    if ((action.focusOverlay || opts.keepOpen) && this.overlay.wasUsedRecently) {
       this.overlay.assertOverlayActive();
     }
   }

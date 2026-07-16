@@ -291,7 +291,8 @@ the configured shortcuts change and removes them during normal shutdown.
 
 Portal actions run on key release so the physical trigger modifiers are no
 longer held. Before an action runs, EE2 verifies the active window with
-`hyprctl -j activewindow`. Because PoE2/Proton rejects compositor and XTest key
-injection, item copying uses a narrow persistent uinput keyboard helper. The
-item text is read directly from Proton's Windows clipboard because its
-X11/Wayland clipboard bridge can remain empty.
+`hyprctl -j activewindow`. Item copying targets PoE2's XWayland window directly
+with `xdotool`. A bundled Rust executable runs inside the game's Proton prefix
+and reads the Windows clipboard because Proton's host clipboard bridge can
+remain empty. The helper uses a bounded readiness/capture protocol and restores
+the prior text in-process when clipboard restoration is enabled.

@@ -301,6 +301,7 @@ export default defineComponent({
     });
 
     const item = shallowRef<null | Result<ParsedItem, ParseError>>(null);
+    const itemSide = shallowRef<"stash" | "inventory" | undefined>();
     const rebuildKey = shallowRef(2);
     const advancedCheck = shallowRef(false);
     const checkPosition = shallowRef({ x: 1, y: 1 });
@@ -316,7 +317,7 @@ export default defineComponent({
       if (e.target !== "price-check") return;
       performance.mark("price-check-event");
 
-      if (Host.isElectron && !e.focusOverlay) {
+      if (Host.isElectron && !e.focusOverlay && !e.keepOpen) {
         // everything in CSS pixels
         const width = 28.75 * AppConfig().fontSize;
         const screenX =
@@ -345,6 +346,7 @@ export default defineComponent({
       closeBrowser();
       wm.show(props.config.wmId);
       checkPosition.value = e.position;
+      itemSide.value = e.side;
       advancedCheck.value = e.focusOverlay;
       performance.mark("price-check-start-handling-item");
       item.value = handleItemPaste({
@@ -436,9 +438,12 @@ export default defineComponent({
       if (isBrowserShown.value) {
         return "inventory";
       } else {
-        return checkPosition.value.x > window.screenX + window.innerWidth / 2
-          ? "inventory"
-          : "stash";
+        return (
+          itemSide.value ||
+          (checkPosition.value.x > window.screenX + window.innerWidth / 2
+            ? "inventory"
+            : "stash")
+        );
         // or {chat, vendor, center of screen}
       }
     });

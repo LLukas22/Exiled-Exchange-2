@@ -182,6 +182,8 @@ type IpcItemText = Event<
     clipboard: string;
     item?: unknown;
     position: { x: number; y: number };
+    side?: "stash" | "inventory";
+    keepOpen?: boolean;
     focusOverlay: boolean;
   }
 >;
