@@ -25,13 +25,17 @@ export interface HyprlandGlobalHotkey {
 }
 
 interface RuntimeBind {
+  id: string;
   modifiers: string;
   key: string;
 }
 
+type HyprlandConfigProvider = "legacy" | "lua";
+
 export class Hyprland {
   private runtimeBinds: RuntimeBind[] = [];
   private protonClipboard = new ProtonClipboard();
+  private configProvider?: HyprlandConfigProvider;
 
   constructor(private windowTitle = "Path of Exile 2") {}
 
@@ -70,12 +74,8 @@ export class Hyprland {
     try {
       for (const hotkey of hotkeys) {
         const { modifiers, key } = splitShortcut(hotkey.accelerator);
-        const bind = { modifiers, key: hyprlandKey(key) };
-        await runHyprctl([
-          "keyword",
-          "bindn",
-          `${bind.modifiers},${bind.key},global,exiled-exchange-2:${hotkey.id}`,
-        ]);
+        const bind = { id: hotkey.id, modifiers, key: hyprlandKey(key) };
+        await this.addGlobalBind(bind);
         this.runtimeBinds.push(bind);
       }
     } catch (error) {
@@ -89,11 +89,7 @@ export class Hyprland {
     this.runtimeBinds = [];
     const results = await Promise.allSettled(
       binds.map(async (bind) => {
-        await runHyprctl([
-          "keyword",
-          "unbind",
-          `${bind.modifiers},${bind.key}`,
-        ]);
+        await this.removeGlobalBind(bind);
       }),
     );
 
@@ -112,6 +108,38 @@ export class Hyprland {
         ? lastError
         : new Error(String(lastError));
     }
+  }
+
+  private async addGlobalBind(bind: RuntimeBind) {
+    if ((await this.getConfigProvider()) === "lua") {
+      await runHyprctl(["eval", addLuaGlobalBind(bind)]);
+      return;
+    }
+
+    await runHyprctl([
+      "keyword",
+      "bindn",
+      `${bind.modifiers},${bind.key},global,${portalShortcut(bind.id)}`,
+    ]);
+  }
+
+  private async removeGlobalBind(bind: RuntimeBind) {
+    if ((await this.getConfigProvider()) === "lua") {
+      await runHyprctl(["eval", removeLuaGlobalBind(bind.id)]);
+      return;
+    }
+
+    await runHyprctl(["keyword", "unbind", `${bind.modifiers},${bind.key}`]);
+  }
+
+  private async getConfigProvider(): Promise<HyprlandConfigProvider> {
+    if (this.configProvider) return this.configProvider;
+
+    const status = await runHyprctl(["status"]).catch(() => "");
+    this.configProvider = /configProvider:\s*lua\b/i.test(status)
+      ? "lua"
+      : "legacy";
+    return this.configProvider;
   }
 
   private async activeGameWindow() {
@@ -146,6 +174,37 @@ export class Hyprland {
       xdotoolShortcut(accelerator),
     ]);
   }
+}
+
+function addLuaGlobalBind(bind: RuntimeBind) {
+  const id = luaString(bind.id);
+  const shortcut = luaString(
+    [...bind.modifiers.split(" ").filter(Boolean), bind.key].join(" + "),
+  );
+  const portalAction = luaString(portalShortcut(bind.id));
+  return [
+    "_G.__ee2_hotkeys = _G.__ee2_hotkeys or {}",
+    `local old = _G.__ee2_hotkeys[${id}]`,
+    "if old then old:remove() end",
+    `_G.__ee2_hotkeys[${id}] = hl.bind(${shortcut}, hl.dsp.global(${portalAction}), { non_consuming = true })`,
+  ].join("; ");
+}
+
+function removeLuaGlobalBind(id: string) {
+  const key = luaString(id);
+  return [
+    "local binds = _G.__ee2_hotkeys",
+    `if binds then local bind = binds[${key}]`,
+    `if bind then bind:remove(); binds[${key}] = nil end end`,
+  ].join("; ");
+}
+
+function portalShortcut(id: string) {
+  return `exiled-exchange-2:${id}`;
+}
+
+function luaString(value: string) {
+  return JSON.stringify(value);
 }
 
 function itemSide(
@@ -197,7 +256,11 @@ function hyprlandKey(key: string) {
 }
 
 async function runHyprctl(args: string[]): Promise<string> {
-  return await runCommand("hyprctl", args);
+  const output = await runCommand("hyprctl", args);
+  if (/^(?:error:|keyword can't work)/i.test(output.trim())) {
+    throw new Error(output.trim());
+  }
+  return output;
 }
 
 async function runCommand(command: string, args: string[]): Promise<string> {
