@@ -157,11 +157,7 @@ export class Hyprland {
   }
 
   private async sendX11Shortcut(accelerator: string) {
-    await runCommand("xdotool", [
-      "key",
-      "--clearmodifiers",
-      xdotoolShortcut(accelerator),
-    ]);
+    await runCommand("xdotool", ["key", xdotoolShortcut(accelerator)]);
   }
 }
 
