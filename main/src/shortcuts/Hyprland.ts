@@ -157,19 +157,8 @@ export class Hyprland {
   }
 
   private async sendX11Shortcut(accelerator: string) {
-    const output = await runCommand("xdotool", [
-      "search",
-      "--onlyvisible",
-      "--class",
-      POE2_STEAM_CLASS,
-    ]);
-    const windowId = output.trim().split("\n").filter(Boolean).at(-1);
-    if (!windowId) throw new Error("Could not find the PoE2 XWayland window");
-
     await runCommand("xdotool", [
       "key",
-      "--window",
-      windowId,
       "--clearmodifiers",
       xdotoolShortcut(accelerator),
     ]);
