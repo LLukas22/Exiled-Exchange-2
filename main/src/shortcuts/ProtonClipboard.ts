@@ -1,9 +1,11 @@
 import { app } from "electron";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { TextDecoder } from "node:util";
+import { promisify } from "node:util";
 
 const READY_MARKER = Buffer.from("EE2_CLIPBOARD_READY_V1\n");
 const HELPER_START_TIMEOUT = 7000;
@@ -11,6 +13,8 @@ const HELPER_SESSION_TIMEOUT = 12000;
 const MAX_PAYLOAD_BYTES = 512 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const POE2_STEAM_APP_ID = "2694490";
+const execFileAsync = promisify(execFile);
 
 class RetryableCaptureError extends Error {}
 
@@ -216,24 +220,27 @@ async function protonEnvironment(pid: number) {
     throw new Error(`Invalid Path of Exile process ID: ${pid}`);
   }
 
-  const entries = (await fs.readFile(`/proc/${pid}/environ`, "utf8"))
-    .split("\0")
-    .filter(Boolean)
-    .flatMap((entry) => {
-      const separator = entry.indexOf("=");
-      return separator > 0
-        ? [[entry.slice(0, separator), entry.slice(separator + 1)] as const]
-        : [];
+  const entries = await fs
+    .readFile(`/proc/${pid}/environ`, "utf8")
+    .then((contents) => parseEnvironment(contents))
+    .catch(async (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
+      return [];
     });
   const environment = new Map(entries);
   const compatDataPath = environment.get("STEAM_COMPAT_DATA_PATH");
-  const prefix =
+  let prefix =
     environment.get("WINEPREFIX") ||
     (compatDataPath ? path.join(compatDataPath, "pfx") : undefined);
-  const toolPath = environment
+  let toolPath = environment
     .get("STEAM_COMPAT_TOOL_PATHS")
     ?.split(":")
     .find(Boolean);
+  if (!prefix || !toolPath) {
+    const discovered = await discoverProtonEnvironment();
+    prefix ??= discovered.prefix;
+    toolPath ??= discovered.toolPath;
+  }
   if (!prefix || !toolPath) {
     throw new Error("Could not determine the running Proton environment");
   }
@@ -252,6 +259,71 @@ async function protonEnvironment(pid: number) {
     wine,
     xdgDataDirs: environment.get("XDG_DATA_DIRS"),
   };
+}
+
+function parseEnvironment(contents: string) {
+  return contents
+    .split("\0")
+    .filter(Boolean)
+    .flatMap((entry) => {
+      const separator = entry.indexOf("=");
+      return separator > 0
+        ? [[entry.slice(0, separator), entry.slice(separator + 1)] as const]
+        : [];
+    });
+}
+
+async function discoverProtonEnvironment() {
+  const [{ stdout }, steamLibraries] = await Promise.all([
+    execFileAsync("ps", ["-eo", "args="], {
+      encoding: "utf8",
+      maxBuffer: 2 * 1024 * 1024,
+    }),
+    findSteamLibraries(),
+  ]);
+  const wineserver = stdout
+    .split("\n")
+    .find(
+      (line) => line.includes("/files/") && /\/wineserver(?:\s|$)/.test(line),
+    );
+  const toolPath = wineserver?.match(
+    /^(.*?)\/files\/.*\/wineserver(?:\s|$)/,
+  )?.[1];
+
+  let prefix: string | undefined;
+  for (const library of steamLibraries) {
+    const candidate = path.join(
+      library,
+      "steamapps",
+      "compatdata",
+      POE2_STEAM_APP_ID,
+      "pfx",
+    );
+    if (await isAccessible(candidate)) {
+      prefix = candidate;
+      break;
+    }
+  }
+  return { prefix, toolPath };
+}
+
+async function findSteamLibraries() {
+  const steamRoot = path.join(os.homedir(), ".local", "share", "Steam");
+  const libraries = new Set([steamRoot]);
+  const registry = await fs
+    .readFile(path.join(steamRoot, "config", "libraryfolders.vdf"), "utf8")
+    .catch(() => "");
+  for (const match of registry.matchAll(/"path"\s+"([^"]+)"/g)) {
+    if (match[1]) libraries.add(match[1].replace(/\\\\/g, "\\"));
+  }
+  return [...libraries];
+}
+
+async function isAccessible(candidate: string) {
+  return await fs
+    .access(candidate, constants.R_OK)
+    .then(() => true)
+    .catch(() => false);
 }
 
 function helperPath() {
